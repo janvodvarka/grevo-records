@@ -170,10 +170,33 @@ function req<T = unknown>(r: IDBRequest<T>): Promise<T> {
   });
 }
 
-export async function estimateStorage(): Promise<{ usage: number; quota: number } | null> {
+export async function estimateStorage(): Promise<{
+  usage: number;
+  quota: number;
+  persisted: boolean;
+} | null> {
   if (!navigator.storage?.estimate) return null;
   const { usage = 0, quota = 0 } = await navigator.storage.estimate();
-  return { usage, quota };
+  let persisted = false;
+  try {
+    persisted = (await navigator.storage.persisted?.()) ?? false;
+  } catch {}
+  return { usage, quota, persisted };
+}
+
+/**
+ * Asks the browser to make this origin's storage persistent, so recordings
+ * are never silently evicted when the disk gets tight. Does NOT raise the
+ * quota (that is disk-derived and browser-controlled) — it only protects
+ * what is already stored. Safe to call repeatedly; returns the final state.
+ */
+export async function requestPersistentStorage(): Promise<boolean> {
+  try {
+    if (await navigator.storage?.persisted?.()) return true;
+    return (await navigator.storage?.persist?.()) ?? false;
+  } catch {
+    return false;
+  }
 }
 
 // ─────────────────── Crash-safe recording buffer ───────────────────

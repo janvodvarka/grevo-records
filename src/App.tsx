@@ -9,6 +9,7 @@ import { Settings } from './components/Settings';
 import { Login } from './components/Login';
 import { RecoveryBanner } from './components/RecoveryBanner';
 import { currentSession, logout as authLogout, type Session } from './lib/auth';
+import { requestPersistentStorage } from './lib/storage';
 import type { StoredRecording } from './types';
 
 export type View = 'home' | 'recording' | 'preview' | 'library' | 'settings';
@@ -31,6 +32,12 @@ export default function App() {
     setSession(null);
     setView('home');
   };
+
+  // Ask once for persistent storage so recordings are never auto-evicted
+  // when the disk gets tight. Does not change the quota size.
+  useEffect(() => {
+    requestPersistentStorage();
+  }, []);
 
   // Re-check session if tab regained focus (in case of logout in another tab)
   useEffect(() => {

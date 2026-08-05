@@ -13,6 +13,7 @@ import {
   Play,
   Eraser,
   Loader2,
+  ShieldCheck,
 } from 'lucide-react';
 import type { StoredRecording } from '../types';
 import { formatBytes, formatDate, formatDuration } from '../lib/format';
@@ -35,7 +36,11 @@ export function Library({ onOpen }: Props) {
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<FilterMode>('all');
   const [sort, setSort] = useState<SortMode>('newest');
-  const [usage, setUsage] = useState<{ usage: number; quota: number } | null>(null);
+  const [usage, setUsage] = useState<{
+    usage: number;
+    quota: number;
+    persisted: boolean;
+  } | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
 
   const load = async () => {
@@ -230,7 +235,15 @@ export function Library({ onOpen }: Props) {
               )}
               <div className="flex-1 min-w-0">
                 <div className="text-xs text-text-secondary mb-1 flex justify-between gap-2">
-                  <span>{formatBytes(usage.usage)} z {formatBytes(usage.quota)}</span>
+                  <span className="inline-flex items-center gap-1.5">
+                    {formatBytes(usage.usage)} z {formatBytes(usage.quota)}
+                    {usage.persisted && (
+                      <ShieldCheck
+                        className="w-3.5 h-3.5 text-success shrink-0"
+                        aria-label="Trvalé úložiště: nahrávky prohlížeč sám nesmaže"
+                      />
+                    )}
+                  </span>
                   <span className="tabular-nums">{pct.toFixed(0)}%</span>
                 </div>
                 <div className="w-full h-1.5 bg-bg-elev rounded-full overflow-hidden">
