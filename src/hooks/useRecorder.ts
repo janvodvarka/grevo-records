@@ -236,12 +236,17 @@ export function useRecorder(): UseRecorderReturn {
                 deviceId: { exact: micDeviceId },
                 echoCancellation: true,
                 noiseSuppression: true,
+                autoGainControl: true,
               },
             });
           } catch {
             try {
               micStreamRef.current = await navigator.mediaDevices.getUserMedia({
-                audio: { echoCancellation: true, noiseSuppression: true },
+                audio: {
+                  echoCancellation: true,
+                  noiseSuppression: true,
+                  autoGainControl: true,
+                },
               });
               toast.warning('Vybraný mikrofon není dostupný, používám výchozí.', {
                 title: 'Mikrofon',
@@ -295,33 +300,46 @@ export function useRecorder(): UseRecorderReturn {
           videoTrack = displayMS.getVideoTracks()[0];
         }
 
-        // 5) Mixed audio (system audio + mic with gain)
-        const audioCtx = new AudioContext();
-        audioCtxRef.current = audioCtx;
-        const audioDest = audioCtx.createMediaStreamDestination();
-        let hasAudio = false;
-
+        // 5) Audio. Piping a mic into an AudioContext makes Chrome drop the
+        //    capture-side noise suppression / echo cancellation, so the
+        //    recording ends up full of room noise. Use the raw, already
+        //    processed mic track directly whenever we can — i.e. no system
+        //    audio to mix in AND the gain slider is at its default. Only fall
+        //    back to Web Audio when we genuinely must mix or change the level.
         const displayAudio = displayMS.getAudioTracks();
-        if (displayAudio.length > 0) {
-          const src = audioCtx.createMediaStreamSource(
-            new MediaStream([displayAudio[0]])
-          );
-          src.connect(audioDest);
-          hasAudio = true;
-        }
-        if (
-          micStreamRef.current &&
-          micStreamRef.current.getAudioTracks().length > 0
-        ) {
-          const src = audioCtx.createMediaStreamSource(micStreamRef.current);
-          const gain = audioCtx.createGain();
-          gain.gain.value = Math.max(0, micGain);
-          src.connect(gain).connect(audioDest);
-          hasAudio = true;
+        const micTrack = micStreamRef.current?.getAudioTracks()[0] ?? null;
+        const needsGain = !!micTrack && Math.abs(micGain - 1) > 0.01;
+        const needsMixing = displayAudio.length > 0 && !!micTrack;
+
+        let audioTrack: MediaStreamTrack | null = null;
+        if (micTrack && !needsMixing && !needsGain) {
+          // Clean path: browser-processed mic, straight into the recording.
+          audioTrack = micTrack;
+        } else if (displayAudio.length > 0 || micTrack) {
+          // Mixing / gain path: Web Audio is unavoidable here (its cost is the
+          // mic processing, accepted only when the user opts into gain or when
+          // system audio must be blended in).
+          const audioCtx = new AudioContext();
+          audioCtxRef.current = audioCtx;
+          const audioDest = audioCtx.createMediaStreamDestination();
+          if (displayAudio.length > 0) {
+            audioCtx
+              .createMediaStreamSource(new MediaStream([displayAudio[0]]))
+              .connect(audioDest);
+          }
+          if (micTrack) {
+            const gain = audioCtx.createGain();
+            gain.gain.value = Math.max(0, micGain);
+            audioCtx
+              .createMediaStreamSource(micStreamRef.current!)
+              .connect(gain)
+              .connect(audioDest);
+          }
+          audioTrack = audioDest.stream.getAudioTracks()[0] ?? null;
         }
 
         const tracks: MediaStreamTrack[] = [videoTrack];
-        if (hasAudio) tracks.push(audioDest.stream.getAudioTracks()[0]);
+        if (audioTrack) tracks.push(audioTrack);
         const combined = new MediaStream(tracks);
 
         // 6) Countdown (streams already active, preview shows)
@@ -509,7 +527,7 @@ export function useRecorder(): UseRecorderReturn {
           recorder.start(1000);
         };
 
-        armAndStart(mimeCandidates(hasAudio));
+        armAndStart(mimeCandidates(!!audioTrack));
 
         displayMS.getVideoTracks()[0].onended = () => {
           if (recorderRef.current && recorderRef.current.state !== 'inactive') {
