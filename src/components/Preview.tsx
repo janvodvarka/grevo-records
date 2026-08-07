@@ -213,9 +213,28 @@ export function Preview({ recording, onBack, onNew, onUpdated, onDeleted }: Prop
               setPlaybackError(null);
               setVideoReady(true);
             }}
-            onError={() => {
+            onError={(e) => {
+              // Surface the actual MediaError — without it "cannot play" gives
+              // no clue whether the file is corrupt (DECODE) or the codec is
+              // unsupported (SRC_NOT_SUPPORTED).
+              const err = e.currentTarget.error;
+              const kind =
+                err?.code === MediaError.MEDIA_ERR_DECODE
+                  ? 'poškozená data videa'
+                  : err?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED
+                  ? 'nepodporovaný formát'
+                  : err?.code === MediaError.MEDIA_ERR_NETWORK
+                  ? 'chyba načítání'
+                  : 'neznámá chyba';
+              console.error('[preview] playback failed', {
+                code: err?.code,
+                message: err?.message,
+                mimeType: recording.mimeType,
+                size: recording.size,
+              });
               setPlaybackError(
-                `Nahrávku se nepodařilo přehrát (formát: ${recording.mimeType || 'neznámý'}). Zkus ji stáhnout a otevřít externě.`
+                `Nahrávku se nepodařilo přehrát: ${kind}. ` +
+                  `Zkus ji stáhnout a otevřít externě.`
               );
             }}
           />

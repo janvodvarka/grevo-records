@@ -400,20 +400,27 @@ export function useRecorder(): UseRecorderReturn {
             const chunk = e.data;
             bytesRef.current += chunk.size;
             setRecordedBytes(bytesRef.current);
-            // Persist to IndexedDB immediately (fire-and-forget). A tab crash
-            // then loses at most the last ~1 s. On IDB failure fall back to RAM
-            // so the recording itself never dies because of storage.
+
+            // RAM is the source of truth for the finished file. IndexedDB
+            // used to be, but an IDB write reports success when the *request*
+            // succeeds — the transaction can still abort afterwards (quota,
+            // disk error). That silently dropped chunks out of the middle of
+            // long recordings, and the assembled MP4 came out missing
+            // keyframes: smeared picture and "cannot play" in the preview.
+            fallbackChunksRef.current.push({ seq: mySeq, chunk });
+
+            // IDB is now purely the crash mirror: if the tab dies, these
+            // chunks are recoverable. Failures here no longer affect the file.
             const p = appendBufferChunk({
               sessionId,
               seq: mySeq,
               mimeType: effectiveMime,
               chunk,
             }).catch((err) => {
-              fallbackChunksRef.current.push({ seq: mySeq, chunk });
               if (!idbWarnedRef.current) {
                 idbWarnedRef.current = true;
-                console.error(
-                  '[recorder] IndexedDB chunk write failed — falling back to RAM buffering:',
+                console.warn(
+                  '[recorder] crash-safe mirror write failed (recording itself is unaffected):',
                   err
                 );
               }
@@ -437,17 +444,46 @@ export function useRecorder(): UseRecorderReturn {
           // chunks), ordered by seq. Never throws — worst case returns only
           // the RAM chunks.
           const assembleBlob = async (): Promise<Blob> => {
-            // Let in-flight chunk writes settle first.
-            await Promise.allSettled([...pendingWritesRef.current]);
-            let idbRows: { seq: number; chunk: Blob }[] = [];
-            try {
-              idbRows = await readBufferChunks(sessionId);
-            } catch (err) {
-              console.error('[recorder] reading chunk buffer failed:', err);
+            // Assemble from the RAM chunks: they are complete by construction,
+            // unlike the IDB mirror (see ondataavailable).
+            let all = [...fallbackChunksRef.current].sort((a, b) => a.seq - b.seq);
+
+            // If RAM somehow has nothing (shouldn't happen), fall back to the
+            // IDB mirror rather than returning an empty file.
+            if (all.length === 0) {
+              await Promise.allSettled([...pendingWritesRef.current]);
+              try {
+                all = (await readBufferChunks(sessionId)).sort(
+                  (a, b) => a.seq - b.seq
+                );
+                console.warn('[recorder] RAM buffer empty, recovered from IDB mirror');
+              } catch (err) {
+                console.error('[recorder] reading chunk buffer failed:', err);
+              }
             }
-            const all = [...idbRows, ...fallbackChunksRef.current].sort(
-              (a, b) => a.seq - b.seq
-            );
+
+            // Integrity check: seq must be a gap-free 0..n-1 run and the byte
+            // total must match what we counted while recording. A hole here
+            // means a silently corrupt video (missing keyframes), which must
+            // never be handed to the user as if it were fine.
+            const expected = seq;
+            const missing: number[] = [];
+            for (let i = 0; i < expected; i++) {
+              if (!all.some((c) => c.seq === i)) missing.push(i);
+            }
+            const bytes = all.reduce((a, c) => a + c.chunk.size, 0);
+            if (missing.length > 0 || bytes !== bytesRef.current) {
+              console.error(
+                `[recorder] chunk integrity check FAILED: ${missing.length}/${expected} chunks missing, ` +
+                  `${bytes} of ${bytesRef.current} bytes`
+              );
+              toast.error(
+                `Nahrávka je nekompletní (chybí ${missing.length} z ${expected} úseků). ` +
+                  'Video by bylo poškozené. Nahrej ho prosím znovu a dej vědět.',
+                { title: 'Poškozená nahrávka', duration: 0 }
+              );
+            }
+
             fallbackChunksRef.current = [];
             return new Blob(
               all.map((r) => r.chunk),
