@@ -460,6 +460,25 @@ app.post('/upload-stream', async (req, res) => {
 
   // 2) Stream the request body straight to the video upload endpoint
   const contentLength = req.headers['content-length'];
+
+  // Byte/time accounting on the inbound body. Without it an aborted upload
+  // logs nothing but "[stream:aborted]", which cannot distinguish our own
+  // timeout from an edge/client one. With it the log line says how far the
+  // body got and after how long — the two numbers that name the culprit.
+  const t0 = Date.now();
+  let received = 0;
+  req.on('data', (c) => {
+    received += c.length;
+  });
+  const progressLine = () => {
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    const mbps = received > 0 ? ((received * 8) / (Date.now() - t0) / 1000).toFixed(1) : '0';
+    return (
+      `guid=${guid} received=${received}` +
+      (contentLength ? `/${contentLength}` : '') +
+      ` after=${secs}s (~${mbps} Mbit/s)`
+    );
+  };
   const uploadReq = https.request(
     `https://video.bunnycdn.com/library/${creds.library}/videos/${guid}`,
     {
@@ -502,18 +521,21 @@ app.post('/upload-stream', async (req, res) => {
   );
 
   uploadReq.on('error', (err) => {
-    console.error('[stream:proxy-error]', err);
+    console.error(`[stream:proxy-error] ${progressLine()}`, err);
     streamApi('DELETE', `/library/${creds.library}/videos/${guid}`, creds.key).catch(() => {});
     if (!res.headersSent) res.status(502).json({ ok: false, error: err.message });
   });
   req.on('error', (err) => {
-    console.error('[stream:req-error]', err);
+    console.error(`[stream:req-error] ${err.code || err.message} ${progressLine()}`);
     uploadReq.destroy(err);
   });
   req.on('aborted', () => {
-    console.warn('[stream:aborted]');
+    console.warn(`[stream:aborted] ${progressLine()}`);
     uploadReq.destroy();
     streamApi('DELETE', `/library/${creds.library}/videos/${guid}`, creds.key).catch(() => {});
+  });
+  req.on('end', () => {
+    console.log(`[stream:body-complete] ${progressLine()}`);
   });
 
   req.pipe(uploadReq);
@@ -596,8 +618,36 @@ app.delete('/file', (req, res) => {
   r.end();
 });
 
-app.listen(Number(PORT), () => {
+const server = app.listen(Number(PORT), () => {
   console.log(
     `[records-by-grevo-proxy] listening on :${PORT} (multi-tenant mode)`
   );
+  // Printed so the effective body-upload budget can be read off the
+  // container log — this is the setting large uploads live or die by.
+  console.log(
+    `[records-by-grevo-proxy] timeouts: requestTimeout=${server.requestTimeout}ms ` +
+      `headersTimeout=${server.headersTimeout}ms keepAliveTimeout=${server.keepAliveTimeout}ms ` +
+      `socketTimeout=${server.timeout}ms`
+  );
 });
+
+// THE reason large uploads died with a bare "network error" in the browser.
+//
+// Node's `server.requestTimeout` (default 300 000 ms since Node 18) is a hard
+// wall-clock cap on receiving an ENTIRE request — headers *and* body. It keeps
+// counting while the body is actively streaming in, and when it expires Node
+// answers 408 and destroys the socket mid-upload. The browser is still sending
+// at that point, so XHR fires `error` with status 0 → "Síťová chyba".
+//
+// `req.setTimeout()` (used by the upload handlers below) does NOT help: that
+// only sets the socket's *idle* timeout, a different mechanism. Reproduced
+// locally on Node 22 — with requestTimeout in force a slow upload is killed
+// whether or not req.setTimeout() was called, and survives once it is raised.
+//
+// 406 MB inside 300 s needs ~11.3 Mbit/s of sustained upstream, which is why
+// this only ever bit long recordings. Give a body upload the same budget the
+// conversion path already reserves for itself.
+server.requestTimeout = CONVERT_REQ_TIMEOUT_MS; // 35 min for the whole body
+server.headersTimeout = 60_000; // must stay below requestTimeout
+server.keepAliveTimeout = 65_000;
+server.timeout = 0; // no socket idle cap; routes set their own

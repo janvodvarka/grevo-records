@@ -13,10 +13,11 @@ import {
   Save,
 } from 'lucide-react';
 import type { StoredRecording } from '../types';
-import { formatDuration } from '../lib/format';
+import { formatBytes, formatDuration } from '../lib/format';
 import { saveRecording } from '../lib/storage';
 import { computeKeptSegments, type Segment } from '../lib/compose';
-import { trimToMp4 } from '../lib/ffmpeg';
+import { cancelConversion, trimToMp4 } from '../lib/ffmpeg';
+import { SERVER_CONVERT_THRESHOLD_BYTES } from '../lib/upload';
 import { replaceRecordingBlob } from '../lib/storage';
 import { confirmDialog } from '../lib/confirm';
 import { useThumbnails } from '../hooks/useThumbnails';
@@ -412,6 +413,25 @@ export function TrimEditor({
       toast.error('Nezbyl žádný úsek k uložení.');
       return null;
     }
+    // Both convert entry points refuse ffmpeg.wasm above this size; the trim
+    // export never did, so a 400 MB source went straight into the wasm heap
+    // (the file, a second copy inside MEMFS, plus the encoder's own
+    // allocations against a ~2 GB cap) and the core aborted — leaving the
+    // promise unsettled and the progress bar stuck forever. Warn instead of
+    // blocking: on an MP4 source the smart cut copies packets and can still
+    // make it, so the call is the user's.
+    if (recording.blob.size >= SERVER_CONVERT_THRESHOLD_BYTES) {
+      const ok = await confirmDialog({
+        title: 'Velké video — střih může selhat',
+        message:
+          `Zdroj má ${formatBytes(recording.blob.size)}. Střih běží v prohlížeči přes ` +
+          'ffmpeg.wasm, který má limit paměti ~2 GB — u takhle velkého souboru může ' +
+          'export trvat velmi dlouho nebo spadnout. Zavřený tab export ukončí. ' +
+          'Chceš to přesto zkusit?',
+        confirmLabel: 'Zkusit export',
+      });
+      if (!ok) return null;
+    }
     setExporting(true);
     setProgressPct(0);
     try {
@@ -750,6 +770,20 @@ export function TrimEditor({
             <div className="flex items-center gap-2 text-sm text-text-secondary mr-2">
               <Loader2 className="w-4 h-4 animate-spin" />
               <span>Exportuji… {Math.round(progressPct)}%</span>
+              {/* A wedged ffmpeg.wasm core used to leave no way out but a tab
+                  reload — which also loses the recording if it is not saved
+                  yet. cancelConversion() terminates the worker and rejects
+                  the pending export. */}
+              <button
+                onClick={() => {
+                  cancelConversion();
+                  toast.info('Export přerušen.');
+                }}
+                className="btn-ghost text-xs"
+                title="Ukončit běžící export (nahrávka zůstane nezměněná)"
+              >
+                <X className="w-3.5 h-3.5" /> Přerušit
+              </button>
             </div>
           )}
           {!persistent && (

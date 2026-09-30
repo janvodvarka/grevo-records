@@ -6,11 +6,28 @@ import { useEffect, useState } from 'react';
  *
  * Falls back to an empty array if decoding fails (e.g. exotic codec).
  */
+/**
+ * Above this size the waveform is skipped. `decodeAudioData` needs the whole
+ * file in an ArrayBuffer *and* the fully decoded PCM at the same time — for a
+ * 400 MB / 10 min recording that is the file (400 MB) plus ~230 MB of
+ * float samples, allocated the moment the preview opens and before the user
+ * asks for anything. The timeline renders fine without peaks; an
+ * out-of-memory tab does not.
+ */
+const MAX_WAVEFORM_BYTES = 150 * 1024 * 1024;
+
 export function useWaveform(blob: Blob | null, samples: number = 240) {
   const [peaks, setPeaks] = useState<number[]>([]);
 
   useEffect(() => {
     if (!blob) {
+      setPeaks([]);
+      return;
+    }
+    if (blob.size > MAX_WAVEFORM_BYTES) {
+      console.info(
+        `[waveform] skipped: ${blob.size} B exceeds the ${MAX_WAVEFORM_BYTES} B decode budget`
+      );
       setPeaks([]);
       return;
     }
@@ -22,7 +39,9 @@ export function useWaveform(blob: Blob | null, samples: number = 240) {
         const buf = await blob.arrayBuffer();
         if (cancelled) return;
         ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-        const audio = await ctx.decodeAudioData(buf.slice(0));
+        // No defensive slice(): decodeAudioData detaches the buffer, and we
+        // never touch it again. The copy just doubled peak memory.
+        const audio = await ctx.decodeAudioData(buf);
         if (cancelled) return;
         const ch = audio.getChannelData(0);
         const out = downsamplePeaks(ch, samples);

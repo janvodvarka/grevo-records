@@ -36,12 +36,21 @@ export function ConvertMp4Button({ recording, onConverted }: Props) {
 
   const handleConvert = async () => {
     // Large files: browser ffmpeg.wasm is slow and capped at ~2 GB.
-    // The Bunny upload converts server-side instead — point the user there.
+    //
+    // This message used to say "upload to Bunny, the server converts it to
+    // MP4" — true when the proxy's /upload?convert=mp4 path was in use, but
+    // the app moved to Bunny Stream (/upload-stream), which uploads the file
+    // as-is and transcodes only to its own HLS renditions. No MP4 file ever
+    // comes back. Telling the user otherwise sent them in a circle, so state
+    // what actually holds instead.
     if (recording.size >= SERVER_CONVERT_THRESHOLD_BYTES) {
       toast.info(
-        `Video má ${formatBytes(recording.size)}, konverze v prohlížeči by trvala dlouho. ` +
-          'Použij „Nahrát na Bunny", server ho zkonvertuje na MP4 sám.',
-        { title: 'Velké video', duration: 9000 }
+        `Video má ${formatBytes(recording.size)} — konverze v prohlížeči by narazila na ` +
+          'limit paměti ffmpeg.wasm (~2 GB) a nedoběhla by. ' +
+          'Pro sdílení klientovi ji nepotřebuješ: nahraj video na Bunny Stream a ' +
+          'přehraje se všude i jako WebM. MP4 soubor do ruky získáš jen tak, že ' +
+          'video stáhneš a zkonvertuješ lokálně (např. v HandBrake).',
+        { title: 'Velké video', duration: 14000 }
       );
       return;
     }

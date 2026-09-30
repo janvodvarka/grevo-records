@@ -149,7 +149,8 @@ export function RecordingView({ onFinish, onCancel }: Props) {
             console.warn('Browser conversion failed, keeping WebM:', convErr);
             toast.warning(
               'Konverze do MP4 selhala. Záznam je bezpečně uložen jako WEBM. ' +
-                'Můžeš zkusit „Konvertovat na MP4" v náhledu, nebo nahrát na Bunny (server zkonvertuje sám). ' +
+                'Můžeš zkusit „Konvertovat na MP4" v náhledu; pro sdílení klientovi ' +
+                'stačí nahrát na Bunny Stream, ten WebM přehraje. ' +
                 ((convErr as Error).message || ''),
               { title: 'MP4 konverze', duration: 10000 }
             );
