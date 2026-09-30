@@ -90,28 +90,94 @@ export function detectRecordingFormat(): 'mp4' | 'webm' | 'unknown' {
   return 'unknown';
 }
 
+/**
+ * Why a recording ended up in the format it did. Without this the app could
+ * not tell the two very different "we got WebM" cases apart: this browser
+ * never offered MP4, versus MP4 was offered, constructed, and then its muxer
+ * errored out at runtime. Both look identical in the finished file.
+ */
+export interface MimeNegotiation {
+  /** Every candidate with the browser's verdict, in the order we tried them. */
+  tried: { mimeType: string; result: 'unsupported' | 'construct-failed' | 'chosen' }[];
+  /** The mime the recorder was constructed with ('' = browser's own choice). */
+  chosen: string;
+  /** Description of a track layout, so a mismatch is visible in the log. */
+  tracks: string;
+}
+
+/**
+ * A recorder error inside this window counts as "died on start" and is worth
+ * retrying in WebM from scratch. Later than that and the captured video is
+ * the user's only copy — it is kept, never silently discarded.
+ */
+const RETRY_ONLY_WITHIN_MS = 3000;
+
+let lastNegotiation: MimeNegotiation | null = null;
+
+/** Last mime negotiation of this tab — for bug reports. */
+export function getLastMimeNegotiation(): MimeNegotiation | null {
+  return lastNegotiation;
+}
+
+function describeTracks(stream: MediaStream): string {
+  return stream
+    .getTracks()
+    .map((t) => {
+      const s = t.getSettings() as MediaTrackSettings & {
+        sampleRate?: number;
+        channelCount?: number;
+      };
+      return t.kind === 'audio'
+        ? `audio(${s.sampleRate ?? '?'}Hz/${s.channelCount ?? '?'}ch, label="${t.label}")`
+        : `video(${s.width ?? '?'}x${s.height ?? '?'}@${s.frameRate ?? '?'})`;
+    })
+    .join(' + ');
+}
+
 /** Try candidates in order; return the first MediaRecorder that constructs. */
 function createRecorder(
   stream: MediaStream,
   candidates: string[]
 ): { recorder: MediaRecorder; mimeType: string } {
   let lastErr: unknown = null;
+  const tried: MimeNegotiation['tried'] = [];
+  const tracks = describeTracks(stream);
+
+  const report = (chosen: string) => {
+    lastNegotiation = { tried, chosen, tracks };
+    // One copy-pasteable line: which candidates the browser accepted, which
+    // one we actually used, and the track layout it was handed.
+    console.info(
+      '[recorder] mime negotiation:',
+      JSON.stringify(lastNegotiation, null, 2)
+    );
+  };
+
   for (const mimeType of candidates) {
-    if (!MediaRecorder.isTypeSupported(mimeType)) continue;
+    if (!MediaRecorder.isTypeSupported(mimeType)) {
+      tried.push({ mimeType, result: 'unsupported' });
+      continue;
+    }
     try {
       const recorder = new MediaRecorder(stream, {
         mimeType,
         videoBitsPerSecond: 5_000_000,
       });
+      tried.push({ mimeType, result: 'chosen' });
+      report(mimeType);
       return { recorder, mimeType };
     } catch (e) {
+      tried.push({ mimeType, result: 'construct-failed' });
       lastErr = e;
     }
   }
   // Last resort: let the browser pick
   try {
-    return { recorder: new MediaRecorder(stream), mimeType: '' };
+    const recorder = new MediaRecorder(stream);
+    report('');
+    return { recorder, mimeType: '' };
   } catch (e) {
+    report('<none>');
     throw lastErr instanceof Error ? lastErr : (e as Error);
   }
 }
@@ -151,6 +217,10 @@ export function useRecorder(): UseRecorderReturn {
   // True from start() entry until the session terminally ends (idle/autostopped).
   const startBusyRef = useRef(false);
   const recorderErrorRef = useRef(false);
+  // Human-readable reason the recorder errored (Chrome puts a DOMException on
+  // the event). Logging the bare event object prints "[object Event]" in a
+  // copied console line, which is why past reports never said what failed.
+  const recorderErrorDetailRef = useRef<string>('');
   const retriedWebmRef = useRef(false);
   const autoResultRef = useRef<StopResult | null>(null);
 
@@ -430,7 +500,15 @@ export function useRecorder(): UseRecorderReturn {
           };
 
           recorder.onerror = (ev) => {
-            console.error('[recorder] error event:', ev);
+            const domErr = (ev as unknown as { error?: DOMException }).error;
+            recorderErrorDetailRef.current = domErr
+              ? `${domErr.name}: ${domErr.message}`
+              : (ev as Event).type || 'unknown';
+            console.error(
+              `[recorder] error event while recording ${effectiveMime}: ` +
+                recorderErrorDetailRef.current,
+              { event: ev, negotiation: getLastMimeNegotiation() }
+            );
             recorderErrorRef.current = true;
             // Chrome typically fires onstop right after error; force it if not.
             if (recorder.state !== 'inactive') {
@@ -526,25 +604,62 @@ export function useRecorder(): UseRecorderReturn {
                 return;
               }
 
-              // c) Recorder errored right after start (typically MP4 muxer
+              // c) Recorder errored right AFTER START (typically the MP4 muxer
               //    rejecting the track layout) — retry once with WebM on the
               //    SAME streams, no new screen picker needed.
-              if (recorderErrorRef.current && !retriedWebmRef.current) {
+              //
+              //    "Right after start" is the load-bearing part. The retry
+              //    discards the buffer and resets the chunk counters, so
+              //    running it on an error that arrived minutes in threw the
+              //    whole recording away silently, behind a 6 s toast. Only
+              //    retry while there is nothing worth keeping.
+              const errorCameLate =
+                blob.size > 0 && durationMs > RETRY_ONLY_WITHIN_MS;
+              if (
+                recorderErrorRef.current &&
+                !retriedWebmRef.current &&
+                !errorCameLate
+              ) {
                 recorderErrorRef.current = false;
                 retriedWebmRef.current = true;
                 clearBuffer();
                 const webmOnly = candidates.filter((c) => c.includes('webm'));
                 try {
-                  console.warn('[recorder] retrying with WebM after MP4 failure');
-                  toast.warning(
-                    'Nahrávání v MP4 selhalo, pokračuji ve WebM. Po uložení můžeš použít „Konvertovat na MP4".',
-                    { title: 'Nahrávání', duration: 6000 }
+                  console.warn(
+                    '[recorder] retrying with WebM after failure of ' +
+                      `${effectiveMime}: ${recorderErrorDetailRef.current}`
                   );
+                  toast.warning(
+                    `Nahrávání v MP4 selhalo (${recorderErrorDetailRef.current}), ` +
+                      'pokračuji ve WebM. Po uložení můžeš použít „Konvertovat na MP4". ' +
+                      'Pošli prosím tuhle hlášku Janovi — bez ní se nedá zjistit, proč MP4 nešlo.',
+                    { title: 'Nahrávání', duration: 0 }
+                  );
+                  // The clock restarts with the new recorder, otherwise the
+                  // saved durationMs counts the discarded MP4 attempt too.
+                  startedAtRef.current = Date.now();
+                  pausedAccumRef.current = 0;
+                  pausedAtRef.current = null;
+                  setElapsedMs(0);
                   armAndStart(webmOnly.length ? webmOnly : ['video/webm']);
                   return;
                 } catch (e) {
                   console.error('[recorder] WebM retry failed too:', e);
                 }
+              }
+
+              if (recorderErrorRef.current && errorCameLate) {
+                // Keep what was captured — it is the user's only copy.
+                console.error(
+                  `[recorder] ${effectiveMime} failed ${Math.round(durationMs / 1000)}s in ` +
+                    `(${recorderErrorDetailRef.current}); keeping the ${blob.size} B captured so far`
+                );
+                toast.error(
+                  `Nahrávání selhalo po ${Math.round(durationMs / 1000)} s ` +
+                    `(${recorderErrorDetailRef.current}). Co se stihlo nahrát, je uložené — ` +
+                    'zkontroluj prosím video v náhledu, může být zkrácené nebo poškozené.',
+                  { title: 'Nahrávání přerušeno', duration: 0 }
+                );
               }
 
               // d) Unexpected stop ("Stop sharing" in browser bar, or fatal

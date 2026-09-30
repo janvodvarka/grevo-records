@@ -72,13 +72,26 @@ function singleUploadAttempt(
     xhr.setRequestHeader('x-stream-key', s.apiKey.trim());
     xhr.setRequestHeader('Content-Type', blob.type || 'application/octet-stream');
 
-    if (onProgress) {
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) {
-          onProgress(e.loaded, e.total, (e.loaded / e.total) * 100);
-        }
-      };
-    }
+    // Explicit: the client must NOT be the one that gives up on a long
+    // upload. 0 = no timeout (also the default, stated here so nobody
+    // "helpfully" adds one — a 400 MB recording legitimately takes minutes).
+    xhr.timeout = 0;
+
+    // Remember how far the body got. `xhr.onerror` carries no diagnostics at
+    // all, and "Síťová chyba" with no numbers is unactionable: 0 B means the
+    // proxy/CORS never accepted us, while most-of-the-file means the
+    // connection was cut mid-body (a timeout somewhere on the path).
+    let sentBytes = 0;
+    let totalBytes = blob.size;
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        sentBytes = e.loaded;
+        totalBytes = e.total;
+        onProgress?.(e.loaded, e.total, (e.loaded / e.total) * 100);
+      }
+    };
+
+    const mb = (n: number) => (n / (1024 * 1024)).toFixed(1);
 
     xhr.onload = () => {
       let data: any = null;
@@ -89,18 +102,41 @@ function singleUploadAttempt(
         resolve({ url: data.url, embedUrl: data.embedUrl, guid: data.guid });
       } else {
         const transient = xhr.status === 0 || xhr.status >= 500;
+        // 408/413 are the two statuses that mean "the size/duration of this
+        // upload was the problem", not "the network blipped". Say so.
+        const sizeHint =
+          xhr.status === 408
+            ? ' Server ukončil příjem těla requestu (408) — upload trval déle, než dovolil timeout na proxy.'
+            : xhr.status === 413
+            ? ' Server odmítl velikost těla requestu (413) — platí limit na proxy nebo na edgi.'
+            : '';
         reject(
           new UploadError(
-            data?.error ||
-              `Upload selhal (${xhr.status}). ${data?.details?.slice(0, 200) ?? ''}`,
+            (data?.error ||
+              `Upload selhal (${xhr.status}). ${data?.details?.slice(0, 200) ?? ''}`) +
+              sizeHint,
             transient
           )
         );
       }
     };
     xhr.onerror = () =>
-      reject(new UploadError('Síťová chyba. Zkontroluj připojení.', true));
-    xhr.ontimeout = () => reject(new UploadError('Upload timeout.', true));
+      reject(
+        new UploadError(
+          `Síťová chyba po ${mb(sentBytes)} z ${mb(totalBytes)} MB. ` +
+            (sentBytes > 0
+              ? 'Spojení bylo přerušeno až během nahrávání těla — typicky timeout na proxy nebo na CDN edgi, ne tvoje připojení.'
+              : 'Nepodařilo se ani začít — zkontroluj připojení, Proxy URL a CORS.'),
+          true
+        )
+      );
+    xhr.ontimeout = () =>
+      reject(
+        new UploadError(
+          `Upload timeout po ${mb(sentBytes)} z ${mb(totalBytes)} MB.`,
+          true
+        )
+      );
     xhr.send(blob);
   });
 }
