@@ -38,12 +38,18 @@ export function Preview({ recording, onBack, onNew, onUpdated, onDeleted }: Prop
   useEffect(() => {
     const u = URL.createObjectURL(recording.blob);
     setUrl(u);
-    setName(recording.name);
     setDuration(recording.durationMs / 1000 || 0);
     setPlaybackError(null);
     setVideoReady(false);
     return () => URL.revokeObjectURL(u);
-  }, [recording.blob, recording.name, recording.durationMs]);
+    // Keyed on the blob only: a pure rename must not reload video/editor.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recording.blob]);
+
+  // Keep the name field in sync without touching the video.
+  useEffect(() => {
+    setName(recording.name);
+  }, [recording.name]);
 
   const handleRename = async () => {
     const trimmed = name.trim();

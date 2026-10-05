@@ -25,6 +25,31 @@ export type ConvertProgress = (
   stage: 'loading' | 'converting'
 ) => void;
 
+export type TrimPathInfo = {
+  path: 'smart-cut' | 're-encode';
+  reason?: string;
+  ms: number;
+};
+
+let lastTrimPath: TrimPathInfo | null = null;
+
+/** Which path the most recent trimToMp4 call took (null before the first). */
+export function getLastTrimPath(): TrimPathInfo | null {
+  return lastTrimPath;
+}
+
+/** MP4 by MIME type, or by 'ftyp' box at bytes 4..8 when the type is empty. */
+async function isMp4(blob: Blob): Promise<boolean> {
+  if (/mp4/i.test(blob.type)) return true;
+  if (blob.type) return false;
+  try {
+    const head = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
+    return String.fromCharCode(...head.slice(4, 8)) === 'ftyp';
+  } catch {
+    return false;
+  }
+}
+
 /** Multithreaded core needs SharedArrayBuffer (COOP/COEP → crossOriginIsolated). */
 export function useMultithreaded(): boolean {
   const forced = new URLSearchParams(location.search).get('core');
@@ -412,19 +437,35 @@ export async function trimToMp4(
   const inputName = 'trim-in';
   const outputName = 'trim-out.mp4';
 
+  const t0 = performance.now();
+  let reason: string | undefined;
+  const finish = (path: 'smart-cut' | 're-encode') => {
+    lastTrimPath = { path, reason, ms: Math.round(performance.now() - t0) };
+    console.info(
+      `[trim] path=${path} ms=${lastTrimPath.ms} reason=${reason ?? '-'}`
+    );
+  };
+
   // Fast path: no speed change + MP4 container → smart cut. Falls back to
   // the re-encode below on any failure (odd codec, probe error, ...).
-  if (rate === 1 && /mp4/i.test(source.type)) {
+  if (rate !== 1) {
+    reason = 'rate-not-1';
+  } else if (!(await isMp4(source))) {
+    reason = 'not-mp4';
+  } else {
     try {
       await ffmpeg.writeFile(inputName, await fetchFile(source));
       try {
-        return await smartCutMp4(ffmpeg, inputName, segments, onProgress);
+        const out = await smartCutMp4(ffmpeg, inputName, segments, onProgress);
+        finish('smart-cut');
+        return out;
       } finally {
         try {
           await ffmpeg.deleteFile(inputName);
         } catch {}
       }
     } catch (err) {
+      reason = 'smart-cut-failed: ' + (err instanceof Error ? err.message : String(err));
       console.warn('[trim] smart cut failed, falling back to re-encode:', err);
       onProgress?.(0, 'converting');
     }
@@ -465,11 +506,12 @@ export async function trimToMp4(
   const commonOut = [
     '-threads', loadedMt ? '4' : '1',
     '-c:v', 'libx264',
-    // superfast: speed/size balance — ultrafast inflated bitrate ~3-5x
-    // (see convertToMp4). This path only runs for WebM sources or speed
-    // changes; MP4 at 1x goes through smartCutMp4 above.
-    '-preset', 'superfast',
-    '-crf', '23',
+    // ultrafast + crf 26: this path only runs for WebM sources or speed
+    // changes (MP4 at 1x goes through smartCutMp4 above). The output is
+    // uploaded to Bunny Stream, which re-encodes anyway, so wasm encode
+    // speed dominates over file size here (convertToMp4 keeps superfast).
+    '-preset', 'ultrafast',
+    '-crf', '26',
     '-g', '60',
     '-pix_fmt', 'yuv420p',
   ];
@@ -505,6 +547,7 @@ export async function trimToMp4(
     const bytes = new Uint8Array(data.byteLength);
     bytes.set(data);
     onProgress?.(100, 'converting');
+    finish('re-encode');
     return new Blob([bytes], { type: 'video/mp4' });
   } catch (err) {
     throw new Error(
