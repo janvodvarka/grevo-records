@@ -162,10 +162,19 @@ function createRecorder(
       continue;
     }
     try {
-      const recorder = new MediaRecorder(stream, {
+      // Measured in Chrome 154: without videoKeyFrameIntervalDuration the 2nd
+      // keyframe of a mostly-static screen recording came at 7.75 s (real
+      // screen content: often longer); with it keyframes land every ~1-2 s.
+      // smartCutMp4 re-encodes only from each cut to the next keyframe, so
+      // sparse GOPs made cuts slow. Browsers ignore unknown options.
+      const options: MediaRecorderOptions & {
+        videoKeyFrameIntervalDuration?: number;
+      } = {
         mimeType,
         videoBitsPerSecond: 5_000_000,
-      });
+        videoKeyFrameIntervalDuration: 1000,
+      };
+      const recorder = new MediaRecorder(stream, options);
       tried.push({ mimeType, result: 'chosen' });
       report(mimeType);
       return { recorder, mimeType };
