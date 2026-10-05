@@ -59,12 +59,13 @@ jobs:
 
       - name: Trigger Bunny rolling update (SPA)
         if: ${{ vars.BUNNY_SPA_APP_ID != '' }}
-        uses: BunnyWay/actions/container-update-image@main
-        with:
-          app_id: ${{ vars.BUNNY_SPA_APP_ID }}
-          api_key: ${{ secrets.BUNNYNET_API_KEY }}
-          container: ${{ vars.BUNNY_SPA_CONTAINER || 'app' }}
-          image_tag: ${{ steps.meta.outputs.sha }}
+        env:
+          BUNNY_API_KEY: ${{ secrets.BUNNYNET_API_KEY }}
+        run: >-
+          .github/scripts/bunny-update.sh
+          "${{ vars.BUNNY_SPA_APP_ID }}"
+          "${{ vars.BUNNY_SPA_CONTAINER || 'app' }}"
+          "${{ steps.meta.outputs.sha }}"
 
   # ────────────────────────────────────────────────────────────────
   # Upload proxy  (Express)
@@ -110,9 +111,10 @@ jobs:
 
       - name: Trigger Bunny rolling update (proxy)
         if: ${{ vars.BUNNY_PROXY_APP_ID != '' }}
-        uses: BunnyWay/actions/container-update-image@main
-        with:
-          app_id: ${{ vars.BUNNY_PROXY_APP_ID }}
-          api_key: ${{ secrets.BUNNYNET_API_KEY }}
-          container: ${{ vars.BUNNY_PROXY_CONTAINER || 'app' }}
-          image_tag: ${{ steps.meta.outputs.sha }}
+        env:
+          BUNNY_API_KEY: ${{ secrets.BUNNYNET_API_KEY }}
+        run: >-
+          .github/scripts/bunny-update.sh
+          "${{ vars.BUNNY_PROXY_APP_ID }}"
+          "${{ vars.BUNNY_PROXY_CONTAINER || 'app' }}"
+          "${{ steps.meta.outputs.sha }}"
