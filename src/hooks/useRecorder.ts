@@ -61,6 +61,9 @@ interface UseRecorderReturn {
 // IMPORTANT: candidates must match the actual track layout. Declaring an
 // audio codec (mp4a/opus) while the stream has no audio track makes Chrome's
 // muxer error out immediately after start — recording "starts then dies".
+/** Sample rates Chrome's MP4/AAC MediaRecorder encoder accepts. */
+const AAC_SAFE_SAMPLE_RATES = [32000, 44100, 48000];
+
 function mimeCandidates(hasAudio: boolean): string[] {
   return hasAudio
     ? [
@@ -380,16 +383,32 @@ export function useRecorder(): UseRecorderReturn {
         const micTrack = micStreamRef.current?.getAudioTracks()[0] ?? null;
         const needsGain = !!micTrack && Math.abs(micGain - 1) > 0.01;
         const needsMixing = displayAudio.length > 0 && !!micTrack;
+        // Chrome's MP4/AAC encoder is only reliable at 32 / 44.1 / 48 kHz. A
+        // low-rate mono track (what Bluetooth / AirPods mics deliver, 16 or
+        // 24 kHz) fails right after start with "EncodingError: Encoder
+        // initialization failed" and the recording drops to WebM — 24 kHz mono
+        // failed 6/6 in Chrome 154, the same track resampled to 48 kHz passed
+        // 6/6. So off-spec mic rates go through Web Audio at 48 kHz.
+        const micRate = micTrack?.getSettings().sampleRate;
+        const needsResample =
+          !!micTrack && !!micRate && !AAC_SAFE_SAMPLE_RATES.includes(micRate);
+        if (needsResample) {
+          console.warn(
+            `[recorder] mic runs at ${micRate} Hz, which the MP4/AAC encoder rejects; resampling to 48 kHz`
+          );
+        }
 
         let audioTrack: MediaStreamTrack | null = null;
-        if (micTrack && !needsMixing && !needsGain) {
+        if (micTrack && !needsMixing && !needsGain && !needsResample) {
           // Clean path: browser-processed mic, straight into the recording.
           audioTrack = micTrack;
         } else if (displayAudio.length > 0 || micTrack) {
-          // Mixing / gain path: Web Audio is unavoidable here (its cost is the
-          // mic processing, accepted only when the user opts into gain or when
-          // system audio must be blended in).
-          const audioCtx = new AudioContext();
+          // Mixing / gain / resample path: Web Audio is unavoidable here (its
+          // cost is the mic processing, accepted only when the user opts into
+          // gain, when system audio must be blended in, or when the mic's
+          // native rate would otherwise knock the recording off MP4). Pinned
+          // to 48 kHz so the output always suits the AAC encoder.
+          const audioCtx = new AudioContext({ sampleRate: 48000 });
           audioCtxRef.current = audioCtx;
           const audioDest = audioCtx.createMediaStreamDestination();
           if (displayAudio.length > 0) {
