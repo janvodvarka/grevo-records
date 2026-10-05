@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Check,
   X,
@@ -11,6 +11,8 @@ import {
   Gauge,
   Sparkles,
   Save,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react';
 import type { StoredRecording } from '../types';
 import { formatBytes, formatDuration } from '../lib/format';
@@ -24,6 +26,7 @@ import { useThumbnails } from '../hooks/useThumbnails';
 import { useWaveform } from '../hooks/useWaveform';
 import { detectSilentRanges } from '../lib/silence';
 import { toast } from '../lib/toast';
+import { TimelineRuler } from './TimelineRuler';
 
 interface Props {
   recording: StoredRecording;
@@ -56,6 +59,21 @@ function genId(): string {
 
 const SPEED_OPTIONS = [0.5, 1, 1.25, 1.5, 2];
 
+const ZOOM_STEP = 1.6;
+/** Playback follow is paused this long after the user scrolls by hand. */
+const FOLLOW_SUSPEND_MS = 1500;
+/** The zoomed-in view shows no less than about this many seconds. */
+const MIN_VISIBLE_SECONDS = 5;
+
+function useDebouncedValue<T>(value: T, ms: number): T {
+  const [v, setV] = useState(value);
+  useEffect(() => {
+    const id = setTimeout(() => setV(value), ms);
+    return () => clearTimeout(id);
+  }, [value, ms]);
+  return v;
+}
+
 export function TrimEditor({
   recording,
   videoEl,
@@ -74,7 +92,24 @@ export function TrimEditor({
   const [progressPct, setProgressPct] = useState(0);
   const [shortcutHelp, setShortcutHelp] = useState(false);
 
+  const [zoom, setZoom] = useState(1);
+  const [viewportW, setViewportW] = useState(0);
+  const [viewportEl, setViewportEl] = useState<HTMLDivElement | null>(null);
+
+  // trackRef is the track *inside* the scrolling content, so its bounding rect
+  // already accounts for zoom and scroll: every x -> time mapping goes via it.
   const trackRef = useRef<HTMLDivElement>(null);
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const playheadElRef = useRef<HTMLDivElement>(null);
+  const zoomRef = useRef(1);
+  const durationRef = useRef(duration);
+  durationRef.current = duration;
+  const maxZoom = Math.max(1, Math.min(duration / MIN_VISIBLE_SECONDS, 200));
+  const maxZoomRef = useRef(maxZoom);
+  maxZoomRef.current = maxZoom;
+  const lastManualScrollRef = useRef(0);
+  const expectedScrollRef = useRef(0);
   const dragRef = useRef<DragHandle>(null);
   const justDraggedRef = useRef(false);
 
@@ -85,12 +120,15 @@ export function TrimEditor({
   // Mirror high-frequency state (playhead) into a ref so the keyboard listener
   // doesn't have to be re-attached every timeupdate.
   const playheadRef = useRef(0);
-  useEffect(() => {
-    playheadRef.current = playhead;
-  }, [playhead]);
 
-  const { thumbnails } = useThumbnails(recording.blob, 16, 56);
-  const { peaks } = useWaveform(recording.blob, 240);
+  const contentWidth = viewportW * zoom;
+  // Debounced so a wheel/pinch gesture does not re-slice peaks or queue
+  // thumbnails for every intermediate zoom level.
+  const settledWidth = useDebouncedValue(contentWidth, 300);
+  const thumbCount = Math.min(128, Math.max(16, Math.ceil(settledWidth / 100)));
+  const peakCount = Math.min(4000, Math.max(240, Math.round(settledWidth / 3)));
+  const { thumbnails } = useThumbnails(recording.blob, thumbCount, 96);
+  const { peaks, basePeaks } = useWaveform(recording.blob, peakCount);
 
   const kept = useMemo(
     () => computeKeptSegments(duration, trimStart, trimEnd, deletes),
@@ -101,20 +139,192 @@ export function TrimEditor({
     [kept]
   );
 
-  // Track playhead & playing state
+  // ────── Zoom / scroll helpers ──────
+  const setScroll = useCallback((x: number) => {
+    const vp = viewportRef.current;
+    if (!vp) return;
+    vp.scrollLeft = x;
+    expectedScrollRef.current = vp.scrollLeft;
+  }, []);
+
+  /** Zoom to `next`, keeping `anchorTime` under viewport-x `anchorVx`. */
+  const applyZoom = useCallback(
+    (next: number, anchorTime: number, anchorVx: number) => {
+      const vp = viewportRef.current;
+      const content = contentRef.current;
+      const dur = durationRef.current;
+      if (!vp || !content || dur <= 0) return;
+      const z = Math.max(1, Math.min(maxZoomRef.current, next));
+      if (Math.abs(z - zoomRef.current) < 1e-6) return;
+      zoomRef.current = z;
+      // Resize synchronously so scrollLeft is not clamped to the old width.
+      content.style.width = `${z * 100}%`;
+      setScroll((anchorTime / dur) * vp.clientWidth * z - anchorVx);
+      setZoom(z);
+    },
+    [setScroll]
+  );
+
+  /** Button/keyboard zoom: anchored on the playhead (or view center if off-screen). */
+  const zoomBy = useCallback(
+    (factor: number) => {
+      const vp = viewportRef.current;
+      if (!vp) return;
+      const dur = durationRef.current;
+      const vw = vp.clientWidth;
+      const t = playheadRef.current;
+      const px = (t / dur) * vw * zoomRef.current;
+      let vx = px - vp.scrollLeft;
+      let time = t;
+      if (vx < 0 || vx > vw) {
+        vx = vw / 2;
+        time = ((vp.scrollLeft + vx) / (vw * zoomRef.current)) * dur;
+      }
+      applyZoom(zoomRef.current * factor, time, vx);
+    },
+    [applyZoom]
+  );
+
+  const zoomFit = useCallback(() => {
+    applyZoom(1, 0, 0);
+  }, [applyZoom]);
+
+  // Viewport width (drives content width in px for thumbnails/waveform/ruler).
   useEffect(() => {
-    const onTime = () => setPlayhead(videoEl.currentTime);
-    const onPlay = () => setIsPlaying(true);
-    const onPause = () => setIsPlaying(false);
+    const vp = viewportRef.current;
+    if (!vp) return;
+    setViewportEl(vp);
+    const read = () => setViewportW(vp.clientWidth);
+    read();
+    const ro = new ResizeObserver(read);
+    ro.observe(vp);
+    return () => ro.disconnect();
+  }, []);
+
+  // Wheel: Ctrl/Cmd + wheel and trackpad pinch (ctrlKey wheel) zoom at the
+  // cursor; plain wheel scrolls sideways when zoomed. Needs a non-passive
+  // native listener to be able to preventDefault.
+  useEffect(() => {
+    const vp = viewportRef.current;
+    if (!vp) return;
+    const onWheel = (e: WheelEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        lastManualScrollRef.current = performance.now();
+        const dy = Math.max(-60, Math.min(60, e.deltaY));
+        const factor = Math.exp(-dy * 0.012);
+        const rect = vp.getBoundingClientRect();
+        const vx = e.clientX - rect.left;
+        const vw = vp.clientWidth;
+        const dur = durationRef.current;
+        const time = ((vp.scrollLeft + vx) / (vw * zoomRef.current)) * dur;
+        applyZoom(zoomRef.current * factor, time, vx);
+        return;
+      }
+      if (zoomRef.current > 1) {
+        const d = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+        if (d === 0) return;
+        e.preventDefault();
+        lastManualScrollRef.current = performance.now();
+        setScroll(vp.scrollLeft + d);
+      }
+    };
+    vp.addEventListener('wheel', onWheel, { passive: false });
+    return () => vp.removeEventListener('wheel', onWheel);
+  }, [applyZoom, setScroll]);
+
+  const onViewportScroll = () => {
+    const vp = viewportRef.current;
+    if (!vp) return;
+    // Scrolls we did not cause (scrollbar drag, touch) pause playback follow.
+    if (Math.abs(vp.scrollLeft - expectedScrollRef.current) > 1.5) {
+      lastManualScrollRef.current = performance.now();
+      expectedScrollRef.current = vp.scrollLeft;
+    }
+  };
+
+  /** Page-style jump: only moves the view when the playhead has left it. */
+  const followPlayhead = useCallback(
+    (t: number) => {
+      const vp = viewportRef.current;
+      if (!vp || zoomRef.current <= 1) return;
+      if (dragRef.current) return;
+      if (performance.now() - lastManualScrollRef.current < FOLLOW_SUSPEND_MS) return;
+      const vw = vp.clientWidth;
+      const px = (t / durationRef.current) * vw * zoomRef.current;
+      if (px < vp.scrollLeft + 8 || px > vp.scrollLeft + vw - 24) {
+        setScroll(px - vw * 0.15);
+      }
+    },
+    [setScroll]
+  );
+
+  // ────── Playhead: rAF-driven while playing, events when paused ──────
+  const paintPlayhead = useCallback((t: number) => {
+    const el = playheadElRef.current;
+    if (el) el.style.left = `${(t / durationRef.current) * 100}%`;
+  }, []);
+
+  useEffect(() => {
+    let lastCommit = 0;
+    const sync = (commit: boolean) => {
+      const t = videoEl.currentTime;
+      playheadRef.current = t;
+      paintPlayhead(t);
+      const now = performance.now();
+      if (commit || now - lastCommit >= 100) {
+        lastCommit = now;
+        setPlayhead(t);
+      }
+    };
+    sync(true);
+
+    let raf = 0;
+    const tick = () => {
+      sync(false);
+      followPlayhead(videoEl.currentTime);
+      raf = requestAnimationFrame(tick);
+    };
+    const startLoop = () => {
+      if (!raf) raf = requestAnimationFrame(tick);
+    };
+    const stopLoop = () => {
+      if (raf) cancelAnimationFrame(raf);
+      raf = 0;
+    };
+
+    const onPlay = () => {
+      setIsPlaying(true);
+      startLoop();
+    };
+    const onPause = () => {
+      setIsPlaying(false);
+      stopLoop();
+      sync(true);
+    };
+    const onSeeked = () => {
+      sync(true);
+      followPlayhead(videoEl.currentTime);
+    };
+    const onTime = () => {
+      if (videoEl.paused) sync(true);
+    };
     videoEl.addEventListener('timeupdate', onTime);
+    videoEl.addEventListener('seeked', onSeeked);
     videoEl.addEventListener('play', onPlay);
     videoEl.addEventListener('pause', onPause);
+    if (!videoEl.paused) {
+      setIsPlaying(true);
+      startLoop();
+    }
     return () => {
+      stopLoop();
       videoEl.removeEventListener('timeupdate', onTime);
+      videoEl.removeEventListener('seeked', onSeeked);
       videoEl.removeEventListener('play', onPlay);
       videoEl.removeEventListener('pause', onPause);
     };
-  }, [videoEl]);
+  }, [videoEl, duration, paintPlayhead, followPlayhead]);
 
   // Apply playback rate
   useEffect(() => {
@@ -160,6 +370,15 @@ export function TrimEditor({
       const handle = dragRef.current;
       if (!handle || !trackRef.current) return;
       justDraggedRef.current = true;
+      // Near the viewport edge while dragging: scroll along.
+      const vp = viewportRef.current;
+      if (vp && zoomRef.current > 1) {
+        const r = vp.getBoundingClientRect();
+        const edge = 32;
+        if (e.clientX < r.left + edge) setScroll(vp.scrollLeft - (r.left + edge - e.clientX));
+        else if (e.clientX > r.right - edge)
+          setScroll(vp.scrollLeft + (e.clientX - (r.right - edge)));
+      }
       const t = pctFromX(e.clientX) * duration;
 
       if (handle.kind === 'trimStart') {
@@ -218,7 +437,7 @@ export function TrimEditor({
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
     };
-  }, [duration, trimStart, trimEnd, deletes, videoEl]);
+  }, [duration, trimStart, trimEnd, deletes, videoEl, setScroll]);
 
   const addCutAtPlayhead = (anchorTime?: number) => {
     const anchor = anchorTime ?? playheadRef.current;
@@ -238,11 +457,11 @@ export function TrimEditor({
   };
 
   const detectAndAddSilentCuts = () => {
-    if (peaks.length === 0 || duration <= 0) {
+    if (basePeaks.length === 0 || duration <= 0) {
       toast.info('Audio se ještě nenačetl. Zkus to za vteřinu.');
       return;
     }
-    const ranges = detectSilentRanges(peaks, duration, {
+    const ranges = detectSilentRanges(basePeaks, duration, {
       threshold: 0.07,
       minDurationSec: 0.6,
       padStart: 0.15,
@@ -329,6 +548,25 @@ export function TrimEditor({
       }
       if (exporting) return;
 
+      // Timeline zoom: = / + in, - out, 0 fit. Leave Cmd/Ctrl combos to the browser.
+      if (!e.metaKey && !e.ctrlKey && !e.altKey) {
+        if (e.key === '=' || e.key === '+') {
+          e.preventDefault();
+          zoomBy(ZOOM_STEP);
+          return;
+        }
+        if (e.key === '-' || e.key === '_') {
+          e.preventDefault();
+          zoomBy(1 / ZOOM_STEP);
+          return;
+        }
+        if (e.key === '0') {
+          e.preventDefault();
+          zoomFit();
+          return;
+        }
+      }
+
       switch (e.code) {
         case 'Space':
           e.preventDefault();
@@ -387,7 +625,7 @@ export function TrimEditor({
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [exporting, trimStart, trimEnd, deletes, videoEl]);
+  }, [exporting, trimStart, trimEnd, deletes, videoEl, zoomBy, zoomFit]);
 
   const handleTrackClick = (e: React.MouseEvent) => {
     if (justDraggedRef.current) return; // ignore click that completed a drag
@@ -501,6 +739,7 @@ export function TrimEditor({
   const trimStartPct = (trimStart / duration) * 100;
   const trimEndPct = (trimEnd / duration) * 100;
   const phPct = (playhead / duration) * 100;
+  const zoomLabel = `${Math.round(zoom * 10) / 10}×`.replace('.', ',');
   const totalRemoved = duration - keptDuration;
   const hasChanges =
     trimStart > 0.01 ||
@@ -543,6 +782,41 @@ export function TrimEditor({
               </button>
             ))}
           </div>
+
+          <div className="inline-flex items-center gap-0.5 bg-bg-elev rounded-lg p-0.5">
+            <button
+              onClick={() => zoomBy(1 / ZOOM_STEP)}
+              disabled={zoom <= 1.001}
+              className="p-1 rounded text-text-secondary hover:text-text-primary disabled:opacity-40 disabled:hover:text-text-secondary transition-colors"
+              title="Oddálit timeline (-)"
+              aria-label="Oddálit timeline"
+            >
+              <ZoomOut className="w-3.5 h-3.5" />
+            </button>
+            <span
+              className="min-w-[38px] text-center font-mono text-xs tabular-nums text-text-primary"
+              title="Aktuální přiblížení timeline"
+            >
+              {zoomLabel}
+            </span>
+            <button
+              onClick={() => zoomBy(ZOOM_STEP)}
+              disabled={zoom >= maxZoom - 0.001}
+              className="p-1 rounded text-text-secondary hover:text-text-primary disabled:opacity-40 disabled:hover:text-text-secondary transition-colors"
+              title="Přiblížit timeline (+)"
+              aria-label="Přiblížit timeline"
+            >
+              <ZoomIn className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={zoomFit}
+              disabled={zoom <= 1.001}
+              className="px-2 py-0.5 rounded text-xs font-medium text-text-secondary hover:text-text-primary disabled:opacity-40 disabled:hover:text-text-secondary transition-colors"
+              title="Zobrazit celé video (0)"
+            >
+              Celé
+            </button>
+          </div>
         </div>
 
         <div className="flex items-center gap-3">
@@ -576,9 +850,19 @@ export function TrimEditor({
           <Shortcut keys="C" desc="Vyříznout úsek tady" />
           <Shortcut keys="Shift + drag" desc="Nakreslit výřez na timeline" />
           <Shortcut keys="⌫ / Delete" desc="Odebrat výřez" />
+          <Shortcut keys="+ / -" desc="Přiblížit / oddálit timeline" />
+          <Shortcut keys="0" desc="Celé video na timeline" />
+          <Shortcut keys="⌘ + kolečko" desc="Zoom na kurzor (i pinch)" />
         </div>
       )}
 
+      <div
+        ref={viewportRef}
+        onScroll={onViewportScroll}
+        className="overflow-x-auto overflow-y-hidden pb-1 [scrollbar-width:thin] [&::-webkit-scrollbar]:h-2"
+      >
+      <div ref={contentRef} style={{ width: `${zoom * 100}%` }}>
+      <TimelineRuler duration={duration} contentWidth={contentWidth} viewport={viewportEl} />
       <div
         ref={trackRef}
         className={`relative h-28 bg-bg-elev rounded-xl select-none overflow-hidden ${
@@ -606,41 +890,9 @@ export function TrimEditor({
         }}
       >
         {/* Thumbnail strip */}
-        {thumbnails.length > 0 && (
-          <div className="absolute inset-0 flex">
-            {thumbnails.map((src, i) => (
-              <div
-                key={i}
-                className="flex-1 h-full bg-cover bg-center opacity-60"
-                style={{ backgroundImage: `url(${src})` }}
-              />
-            ))}
-          </div>
-        )}
+        <ThumbnailStrip thumbnails={thumbnails} />
 
-        {/* Audio waveform — overlay over thumbnails */}
-        {peaks.length > 0 && (
-          <svg
-            className="absolute inset-x-0 bottom-0 w-full h-12 pointer-events-none"
-            preserveAspectRatio="none"
-            viewBox={`0 0 ${peaks.length} 100`}
-          >
-            <g fill="rgba(232,163,61,0.7)">
-              {peaks.map((p, i) => {
-                const h = Math.max(2, p * 100);
-                return (
-                  <rect
-                    key={i}
-                    x={i}
-                    y={(100 - h) / 2 + 50 - h / 2}
-                    width={0.8}
-                    height={h}
-                  />
-                );
-              })}
-            </g>
-          </svg>
-        )}
+        <Waveform peaks={peaks} />
 
         {/* Outside-trim overlay */}
         <div
@@ -718,11 +970,13 @@ export function TrimEditor({
 
         {/* Playhead */}
         <div
+          ref={playheadElRef}
           className="absolute top-0 bottom-0 w-0.5 bg-white pointer-events-none z-20 shadow-[0_0_8px_rgba(255,255,255,0.6)]"
-          style={{ left: `${phPct}%` }}
         >
           <div className="absolute -top-1 -left-[5px] w-3 h-3 bg-white rotate-45" />
         </div>
+      </div>
+      </div>
       </div>
 
       <div className="flex items-center justify-between mt-3 text-xs text-text-muted tabular-nums">
@@ -748,7 +1002,7 @@ export function TrimEditor({
           </button>
           <button
             onClick={detectAndAddSilentCuts}
-            disabled={exporting || peaks.length === 0}
+            disabled={exporting || basePeaks.length === 0}
             className="btn-secondary"
             title="Najít delší pauzy a navrhnout je k odstranění"
           >
@@ -831,3 +1085,40 @@ function Shortcut({ keys, desc }: { keys: string; desc: string }) {
     </div>
   );
 }
+
+const ThumbnailStrip = memo(function ThumbnailStrip({ thumbnails }: { thumbnails: string[] }) {
+  if (thumbnails.length === 0) return null;
+  return (
+    <div className="absolute inset-0 flex">
+      {thumbnails.map((src, i) => (
+        <div
+          key={i}
+          className="flex-1 h-full bg-cover bg-center opacity-60"
+          style={{ backgroundImage: `url(${src})` }}
+        />
+      ))}
+    </div>
+  );
+});
+
+/** One <path> instead of thousands of <rect>s; memoized so playback ticks skip it. */
+const Waveform = memo(function Waveform({ peaks }: { peaks: number[] }) {
+  const d = useMemo(() => {
+    let out = '';
+    for (let i = 0; i < peaks.length; i++) {
+      const h = Math.max(2, peaks[i] * 100);
+      out += `M${i} ${(100 - h).toFixed(1)}h0.85v${h.toFixed(1)}h-0.85z`;
+    }
+    return out;
+  }, [peaks]);
+  if (peaks.length === 0) return null;
+  return (
+    <svg
+      className="absolute inset-x-0 bottom-0 w-full h-12 pointer-events-none"
+      preserveAspectRatio="none"
+      viewBox={`0 0 ${peaks.length} 100`}
+    >
+      <path d={d} fill="rgba(232,163,61,0.7)" />
+    </svg>
+  );
+});

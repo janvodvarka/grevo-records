@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
 /**
  * Decodes the audio track of a media blob (mp4/webm) and returns a downsampled
@@ -16,19 +16,24 @@ import { useEffect, useState } from 'react';
  */
 const MAX_WAVEFORM_BYTES = 150 * 1024 * 1024;
 
+/**
+ * Resolution of the cached envelope. The audio is decoded once, reduced to this
+ * many max-abs bins (a few hundred KB instead of hundreds of MB of PCM) and
+ * every peak array requested later is derived from it, so zooming the
+ * timeline never triggers a second decode.
+ */
+const ENVELOPE_BINS = 32768;
+
 export function useWaveform(blob: Blob | null, samples: number = 240) {
-  const [peaks, setPeaks] = useState<number[]>([]);
+  const [envelope, setEnvelope] = useState<Float32Array | null>(null);
 
   useEffect(() => {
-    if (!blob) {
-      setPeaks([]);
-      return;
-    }
+    setEnvelope(null);
+    if (!blob) return;
     if (blob.size > MAX_WAVEFORM_BYTES) {
       console.info(
         `[waveform] skipped: ${blob.size} B exceeds the ${MAX_WAVEFORM_BYTES} B decode budget`
       );
-      setPeaks([]);
       return;
     }
     let cancelled = false;
@@ -43,12 +48,10 @@ export function useWaveform(blob: Blob | null, samples: number = 240) {
         // never touch it again. The copy just doubled peak memory.
         const audio = await ctx.decodeAudioData(buf);
         if (cancelled) return;
-        const ch = audio.getChannelData(0);
-        const out = downsamplePeaks(ch, samples);
-        setPeaks(out);
+        setEnvelope(buildEnvelope(audio.getChannelData(0), ENVELOPE_BINS));
       } catch {
         // Decoding may fail for some codecs; we just skip the waveform.
-        if (!cancelled) setPeaks([]);
+        if (!cancelled) setEnvelope(null);
       } finally {
         ctx?.close().catch(() => {});
       }
@@ -58,9 +61,37 @@ export function useWaveform(blob: Blob | null, samples: number = 240) {
       cancelled = true;
       ctx?.close().catch(() => {});
     };
-  }, [blob, samples]);
+  }, [blob]);
 
-  return { peaks };
+  const peaks = useMemo(
+    () => (envelope ? downsamplePeaks(envelope, samples) : []),
+    [envelope, samples]
+  );
+  // Fixed coarse resolution, used for silence detection so its behaviour does
+  // not change with the zoom level.
+  const basePeaks = useMemo(
+    () => (envelope ? downsamplePeaks(envelope, 240) : []),
+    [envelope]
+  );
+
+  return { peaks, basePeaks };
+}
+
+function buildEnvelope(data: Float32Array, bins: number): Float32Array {
+  const n = Math.max(1, Math.min(bins, data.length));
+  const out = new Float32Array(n);
+  const step = data.length / n;
+  for (let i = 0; i < n; i++) {
+    const start = Math.floor(i * step);
+    const end = Math.max(start + 1, Math.floor((i + 1) * step));
+    let max = 0;
+    for (let j = start; j < end && j < data.length; j++) {
+      const v = Math.abs(data[j]);
+      if (v > max) max = v;
+    }
+    out[i] = max;
+  }
+  return out;
 }
 
 function downsamplePeaks(data: Float32Array, target: number): number[] {
@@ -69,10 +100,10 @@ function downsamplePeaks(data: Float32Array, target: number): number[] {
   const step = data.length / target;
   for (let i = 0; i < target; i++) {
     const start = Math.floor(i * step);
-    const end = Math.floor((i + 1) * step);
+    const end = Math.max(start + 1, Math.floor((i + 1) * step));
     let max = 0;
-    for (let j = start; j < end; j++) {
-      const v = Math.abs(data[j]);
+    for (let j = start; j < end && j < data.length; j++) {
+      const v = data[j];
       if (v > max) max = v;
     }
     out[i] = max;
