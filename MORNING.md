@@ -49,7 +49,7 @@ GHCR má nejnovější image. **Bunny pořád servuje starý** — potřebujeme 
 4. Počkej ~30s na rolling update
 
 **Verifikace:**
-- Otevři https://mc-vk9ifcyrb6.bunny.run/ v Chrome (`Cmd+Shift+R` hard refresh)
+- Otevři https://grevo-records.bunny.run/ v Chrome (`Cmd+Shift+R` hard refresh)
 - V sidebaru vlevo dole uvidíš SHA — měl by být `69a333a` nebo novější
 - Pokud stejný starý → ještě 1× hard refresh, případně otevři v anonymním okně
 
@@ -66,7 +66,7 @@ GHCR má nejnovější image. **Bunny pořád servuje starý** — potřebujeme 
    - **Otestovat** → mód `multi-tenant` ✅
    - Uložit
 3. **Pošli Gregorovi**:
-   - URL: https://mc-vk9ifcyrb6.bunny.run/
+   - URL: https://grevo-records.bunny.run/
    - Login: `gregor@grevo.cz` / `Grevo!32462`
    - V Settings si vyplní svoje Bunny údaje sám
 
