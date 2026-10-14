@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Cloud,
   UploadCloud,
@@ -8,27 +8,28 @@ import {
   Check,
   CheckCircle2,
   AlertTriangle,
+  X,
 } from 'lucide-react';
 import type { StoredRecording } from '../types';
-import { uploadToBunny, pollStreamStatus } from '../lib/upload';
-import { setUploadedUrl, setStreamStatus, renameRecording } from '../lib/storage';
+import { renameRecording } from '../lib/storage';
 import { isBunnyConfigured } from '../lib/settings';
 import { formatBytes } from '../lib/format';
 import { toast } from '../lib/toast';
 import { promptDialog } from '../lib/confirm';
-import { keptSegments } from '../lib/edits';
+import {
+  cancelUpload,
+  enqueueUpload,
+  isActive,
+  latestJobFor,
+  useUploadJobs,
+  watchStreamStatus,
+} from '../lib/uploads';
 
 interface Props {
   recording: StoredRecording;
   variant?: 'primary' | 'secondary' | 'icon';
   onUploaded?: (rec: StoredRecording) => void;
 }
-
-type State =
-  | { kind: 'idle' }
-  | { kind: 'uploading'; loaded: number; total: number; pct: number }
-  | { kind: 'success'; url: string }
-  | { kind: 'error'; message: string };
 
 // Auto-generated names look like recording-2026-07-02_17-45-38 — worth
 // prompting for something a client will actually see in the library.
@@ -40,64 +41,34 @@ function normalizeUrl(url: string): string {
   return 'https://' + url.replace(/^\/+/, '');
 }
 
+/**
+ * Starts an upload and shows its state. The upload itself runs in the
+ * background manager (lib/uploads), not here: leaving this screen does not
+ * stop it, and coming back shows the live progress.
+ */
 export function UploadButton({ recording, variant = 'secondary', onUploaded }: Props) {
-  const [state, setState] = useState<State>(
-    recording.uploadedUrl
-      ? { kind: 'success', url: recording.uploadedUrl }
-      : { kind: 'idle' }
-  );
+  const jobs = useUploadJobs();
   const [copied, setCopied] = useState(false);
-  const [streamState, setStreamState] = useState<
-    'processing' | 'ready' | 'error' | null
-  >(recording.uploadedUrl ? recording.streamStatus ?? 'ready' : null);
   const configured = isBunnyConfigured();
-  const pollAbort = useRef<AbortController | null>(null);
 
+  // A job only describes this recording if the cut did not change after it
+  // started — re-cutting clears the upload, an older finished job is stale.
+  const rawJob = latestJobFor(recording.id, jobs);
+  const job =
+    rawJob && !(recording.edits && recording.edits.updatedAt > rawJob.createdAt)
+      ? rawJob
+      : undefined;
+  const active = job && isActive(job) ? job : undefined;
+  const url = recording.uploadedUrl ?? (job?.status === 'done' ? job.url : undefined);
+  const streamState: 'processing' | 'ready' | 'error' =
+    recording.streamStatus ?? (job?.status === 'done' ? 'processing' : 'ready');
+
+  // Re-opened a recording Bunny was still processing: keep watching it.
   useEffect(() => {
-    if (recording.uploadedUrl) {
-      setState({ kind: 'success', url: recording.uploadedUrl });
-      setStreamState(recording.streamStatus ?? 'ready');
-    } else {
-      setState({ kind: 'idle' });
-      setStreamState(null);
+    if (recording.uploadedUrl && recording.streamGuid && recording.streamStatus === 'processing') {
+      watchStreamStatus(recording.id, recording.streamGuid, recording.name);
     }
-  }, [recording.id, recording.uploadedUrl, recording.streamStatus]);
-
-  // Resume polling if we re-open a recording that was still processing.
-  useEffect(() => {
-    if (
-      recording.uploadedUrl &&
-      recording.streamGuid &&
-      recording.streamStatus === 'processing'
-    ) {
-      startPolling(recording.id, recording.streamGuid);
-    }
-    return () => pollAbort.current?.abort();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [recording.id]);
-
-  const startPolling = (id: string, guid: string) => {
-    pollAbort.current?.abort();
-    const ac = new AbortController();
-    pollAbort.current = ac;
-    setStreamState('processing');
-    pollStreamStatus(guid, (s) => setStreamState(s.state), { signal: ac.signal })
-      .then(async (final) => {
-        if (ac.signal.aborted) return;
-        await setStreamStatus(id, final.state).catch(() => {});
-        setStreamState(final.state);
-        if (final.state === 'ready') {
-          toast.success('Video je zpracované, link je připravený poslat klientovi.', {
-            title: 'Hotovo',
-          });
-        } else if (final.state === 'error') {
-          toast.error('Bunny hlásí chybu při zpracování videa. Zkus ho nahrát znovu.', {
-            title: 'Zpracování selhalo',
-          });
-        }
-      })
-      .catch(() => {});
-  };
+  }, [recording.id, recording.uploadedUrl, recording.streamGuid, recording.streamStatus, recording.name]);
 
   const handleUpload = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -127,48 +98,21 @@ export function UploadButton({ recording, variant = 'secondary', onUploaded }: P
           : title;
       try {
         await renameRecording(recording.id, uploadName);
+        onUploaded?.({ ...recording, name: uploadName });
       } catch {
         /* non-fatal: upload can still proceed with the chosen name */
       }
     }
 
-    setState({ kind: 'uploading', loaded: 0, total: recording.size, pct: 0 });
-    try {
-      const result = await uploadToBunny(
-        recording.blob,
-        uploadName,
-        (loaded, total, pct) =>
-          setState({ kind: 'uploading', loaded, total, pct }),
-        {
-          // Saved cut is applied on the server, natively, during this upload.
-          segments: keptSegments(recording),
-          onRetry: (attempt, reason) =>
-            toast.warning(`Pokus ${attempt} selhal (${reason}). Zkouším znovu…`, {
-              title: 'Upload retry',
-              duration: 4000,
-            }),
-        }
-      );
-      const updated = await setUploadedUrl(recording.id, result.url, result.guid);
-      setState({ kind: 'success', url: result.url });
-      toast.success('Nahráno na Bunny Stream. Sleduju zpracování…', {
-        title: 'Nahráno',
-      });
-      if (updated && onUploaded) onUploaded(updated);
-      if (result.guid) startPolling(recording.id, result.guid);
-      else setStreamState('ready');
-    } catch (err) {
-      const message = (err as Error).message;
-      setState({ kind: 'error', message });
-      toast.error(message, { title: 'Upload selhal' });
-    }
+    enqueueUpload({ ...recording, name: uploadName }, uploadName);
+    toast.info('Upload běží na pozadí. Můžeš mezitím dál pracovat.', { duration: 4000 });
   };
 
   const copyLink = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (state.kind !== 'success') return;
+    if (!url) return;
     try {
-      await navigator.clipboard.writeText(normalizeUrl(state.url));
+      await navigator.clipboard.writeText(normalizeUrl(url));
       setCopied(true);
       toast.success('Link zkopírován do schránky.');
       setTimeout(() => setCopied(false), 1500);
@@ -177,9 +121,31 @@ export function UploadButton({ recording, variant = 'secondary', onUploaded }: P
     }
   };
 
+  const progressLabel = active
+    ? active.status === 'queued'
+      ? 'Čeká ve frontě…'
+      : active.status === 'cutting'
+      ? 'Server stříhá video…'
+      : `Nahrávám… ${Math.round(active.pct)} % (${formatBytes(active.loaded)} / ${formatBytes(active.total)})`
+    : '';
+
   // ───── Compact (icon) variant for cards ─────
   if (variant === 'icon') {
-    if (state.kind === 'success') {
+    if (active) {
+      return (
+        <span
+          title={`${progressLabel} Klikni pro zrušení.`}
+          onClick={(e) => {
+            e.stopPropagation();
+            cancelUpload(active.id);
+          }}
+          className="btn-ghost p-1.5 cursor-pointer text-accent"
+        >
+          <Loader2 className="w-4 h-4 animate-spin" />
+        </span>
+      );
+    }
+    if (url) {
       return (
         <span
           onClick={copyLink}
@@ -188,7 +154,7 @@ export function UploadButton({ recording, variant = 'secondary', onUploaded }: P
               ? 'Bunny video zpracovává… link už jde kopírovat'
               : copied
               ? 'Zkopírováno'
-              : `Kopírovat link (${normalizeUrl(state.url)})`
+              : `Kopírovat link (${normalizeUrl(url)})`
           }
           className="btn-ghost p-1.5 cursor-pointer text-accent"
         >
@@ -199,16 +165,6 @@ export function UploadButton({ recording, variant = 'secondary', onUploaded }: P
           ) : (
             <Cloud className="w-4 h-4" />
           )}
-        </span>
-      );
-    }
-    if (state.kind === 'uploading') {
-      return (
-        <span
-          title={`Nahrávám ${Math.round(state.pct)}%`}
-          className="btn-ghost p-1.5 cursor-default text-accent"
-        >
-          <Loader2 className="w-4 h-4 animate-spin" />
         </span>
       );
     }
@@ -224,7 +180,31 @@ export function UploadButton({ recording, variant = 'secondary', onUploaded }: P
   }
 
   // ───── Full button variant for Preview ─────
-  if (state.kind === 'success') {
+  if (active) {
+    return (
+      <div className="flex flex-col gap-2 min-w-[260px]">
+        <div className="flex items-center gap-2 text-sm">
+          <Loader2 className="w-4 h-4 animate-spin text-accent shrink-0" />
+          <span className="flex-1">{progressLabel}</span>
+          <button
+            onClick={() => cancelUpload(active.id)}
+            className="btn-ghost p-1 text-xs"
+            title="Přerušit upload"
+          >
+            <X className="w-3.5 h-3.5" /> Přerušit
+          </button>
+        </div>
+        <div className="w-full h-1.5 bg-bg-elev rounded-full overflow-hidden">
+          <div
+            className={`h-full bg-accent transition-all ${active.status !== 'uploading' ? 'animate-pulse' : ''}`}
+            style={{ width: `${active.status === 'queued' ? 0 : active.pct}%` }}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (url) {
     return (
       <div className="flex flex-wrap items-center gap-2 bg-accent-subtle border border-accent/30 rounded-xl px-3 py-2">
         {streamState === 'processing' ? (
@@ -244,7 +224,7 @@ export function UploadButton({ recording, variant = 'secondary', onUploaded }: P
           </>
         )}
         <code className="text-xs text-text-primary bg-bg-elev rounded px-2 py-0.5 max-w-[260px] truncate">
-          {normalizeUrl(state.url)}
+          {normalizeUrl(url)}
         </code>
         <button onClick={copyLink} className="btn-ghost p-1.5 text-xs">
           {copied ? (
@@ -258,36 +238,13 @@ export function UploadButton({ recording, variant = 'secondary', onUploaded }: P
           )}
         </button>
         <a
-          href={normalizeUrl(state.url)}
+          href={normalizeUrl(url)}
           target="_blank"
           rel="noreferrer"
           className="btn-ghost p-1.5 text-xs"
         >
           <ExternalLink className="w-3.5 h-3.5" /> Otevřít
         </a>
-      </div>
-    );
-  }
-
-  if (state.kind === 'uploading') {
-    return (
-      <div className="flex flex-col gap-2 min-w-[240px]">
-        <div className="flex items-center gap-2 text-sm">
-          <Loader2 className="w-4 h-4 animate-spin text-accent" />
-          <span>
-            {state.pct >= 100 && keptSegments(recording)
-              ? 'Server stříhá video…'
-              : `Nahrávám… ${Math.round(state.pct)}% (${formatBytes(
-                  state.loaded
-                )} / ${formatBytes(state.total)})`}
-          </span>
-        </div>
-        <div className="w-full h-1.5 bg-bg-elev rounded-full overflow-hidden">
-          <div
-            className="h-full bg-accent transition-all"
-            style={{ width: `${state.pct}%` }}
-          />
-        </div>
       </div>
     );
   }
@@ -302,8 +259,8 @@ export function UploadButton({ recording, variant = 'secondary', onUploaded }: P
       >
         <UploadCloud className="w-4 h-4" /> Nahrát na Bunny
       </button>
-      {state.kind === 'error' && (
-        <span className="text-xs text-danger max-w-[260px]">{state.message}</span>
+      {job?.status === 'error' && (
+        <span className="text-xs text-danger max-w-[260px]">{job.error}</span>
       )}
     </div>
   );

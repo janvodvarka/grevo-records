@@ -1,6 +1,8 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { MobileNav } from './components/MobileNav';
+import { UploadTray } from './components/UploadTray';
+import { onRecordingUpdated } from './lib/uploads';
 import { Home } from './components/Home';
 import { RecordingView } from './components/RecordingView';
 import { Preview } from './components/Preview';
@@ -9,7 +11,7 @@ import { Settings } from './components/Settings';
 import { Login } from './components/Login';
 import { RecoveryBanner } from './components/RecoveryBanner';
 import { currentSession, logout as authLogout, type Session } from './lib/auth';
-import { requestPersistentStorage } from './lib/storage';
+import { getRecording, requestPersistentStorage } from './lib/storage';
 import type { StoredRecording } from './types';
 
 export type View = 'home' | 'recording' | 'preview' | 'library' | 'settings';
@@ -26,6 +28,25 @@ export default function App() {
   }, []);
 
   const refreshLibrary = useCallback(() => setLibraryVersion((v) => v + 1), []);
+
+  // A background upload finished or Bunny finished processing: keep the open
+  // recording in sync without the user having to reload it.
+  useEffect(
+    () =>
+      onRecordingUpdated((rec) =>
+        setActiveRecording((cur) => (cur && cur.id === rec.id ? rec : cur))
+      ),
+    []
+  );
+
+  // From the upload tray: jump to a recording by id.
+  const openRecordingById = useCallback(
+    async (id: string) => {
+      const rec = await getRecording(id);
+      if (rec) goPreview(rec);
+    },
+    [goPreview]
+  );
 
   const handleLogout = () => {
     authLogout();
@@ -73,6 +94,7 @@ export default function App() {
             onNavigate={(v) => setView(v)}
             onLogout={handleLogout}
           />
+          <UploadTray onOpenRecording={openRecordingById} />
         </>
       )}
       <main className="flex-1 min-w-0 relative overflow-hidden">

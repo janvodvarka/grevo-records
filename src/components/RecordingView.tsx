@@ -4,10 +4,11 @@ import { useRecorder } from '../hooks/useRecorder';
 import { LivePreview } from './LivePreview';
 import { formatDuration } from '../lib/format';
 import { formatBytes } from '../lib/format';
-import { saveRecording, setUploadedUrl, deleteRecording } from '../lib/storage';
+import { saveRecording, deleteRecording } from '../lib/storage';
 import { convertToMp4, preloadFFmpeg } from '../lib/ffmpeg';
 import { loadBunnySettings, isBunnyConfigured } from '../lib/settings';
-import { uploadToBunny, SERVER_CONVERT_THRESHOLD_BYTES } from '../lib/upload';
+import { SERVER_CONVERT_THRESHOLD_BYTES } from '../lib/upload';
+import { enqueueUpload } from '../lib/uploads';
 import { toast } from '../lib/toast';
 import type { StoredRecording } from '../types';
 
@@ -164,22 +165,14 @@ export function RecordingView({ onFinish, onCancel }: Props) {
       }
 
       const settings = loadBunnySettings();
+      // Auto-upload goes to the background queue: the user lands on the
+      // preview straight away and can edit or record the next take while it
+      // uploads, instead of waiting on a full-screen progress bar.
       if (settings.autoUpload && isBunnyConfigured(settings)) {
-        try {
-          setStage({ kind: 'uploading', pct: 0 });
-          const up = await uploadToBunny(rec.blob, rec.name, (_l, _t, pct) =>
-            setStage({ kind: 'uploading', pct })
-          );
-          const updated = await setUploadedUrl(rec.id, up.url, up.guid);
-          if (updated) rec = updated;
-        } catch (uploadErr) {
-          console.warn('Auto-upload failed:', uploadErr);
-          toast.warning(
-            'Auto-upload na Bunny selhal. Záznam je uložen lokálně. ' +
-              (uploadErr as Error).message,
-            { title: 'Upload', duration: 8000 }
-          );
-        }
+        enqueueUpload(rec, rec.name);
+        toast.info('Nahrávám na Bunny na pozadí. Průběh vidíš vpravo dole.', {
+          duration: 5000,
+        });
       }
 
       onFinish(rec);

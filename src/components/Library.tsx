@@ -23,6 +23,7 @@ import { downloadBlob } from '../lib/download';
 import { UploadButton } from './UploadButton';
 import { confirmDialog } from '../lib/confirm';
 import { keptSegments, editedDurationMs, materialize } from '../lib/edits';
+import { onRecordingUpdated } from '../lib/uploads';
 import { toast } from '../lib/toast';
 
 type FilterMode = 'all' | 'uploaded' | 'local';
@@ -61,6 +62,10 @@ export function Library({ onOpen }: Props) {
   useEffect(() => {
     load();
   }, []);
+
+  // Background upload finished / Bunny finished processing: refresh the
+  // cards in place (no remount, so filters and selection survive).
+  useEffect(() => onRecordingUpdated(() => load()), []);
 
   const filtered = useMemo(() => {
     let list = recordings.filter((r) =>

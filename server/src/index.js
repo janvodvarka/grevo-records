@@ -560,6 +560,20 @@ app.post('/upload-stream', async (req, res) => {
 async function handleCutStreamUpload(req, res, creds, title, collection, segments) {
   const workDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'rbg-cut-'));
   const ct = String(req.headers['content-type'] || '');
+
+  // The user can cancel at any point, including after the body has arrived
+  // (while the server cuts or pushes to Bunny). A closed connection before
+  // we answered means "cancelled": stop, and never leave a video behind.
+  let clientGone = false;
+  let putReq = null;
+  res.on('close', () => {
+    if (res.writableEnded) return;
+    clientGone = true;
+    if (putReq) putReq.destroy(new Error('cancelled by client'));
+  });
+  const bailIfGone = () => {
+    if (clientGone) throw new Error('cancelled by client');
+  };
   const inPath = path.join(workDir, 'in' + (/webm/i.test(ct) ? '.webm' : /mp4/i.test(ct) ? '.mp4' : ''));
   let guid = null;
   try {
@@ -581,9 +595,11 @@ async function handleCutStreamUpload(req, res, creds, title, collection, segment
         `${segments.length} segment(s)`
     );
 
+    bailIfGone();
     const cut = await cutToFile(inPath, segments, workDir);
     const outSize = (await fsp.stat(cut.outPath)).size;
     console.log(`[stream:cut] ${cut.mode} cut in ${cut.ms} ms -> ${outSize} B`);
+    bailIfGone();
 
     const created = await streamApi(
       'POST',
@@ -602,6 +618,7 @@ async function handleCutStreamUpload(req, res, creds, title, collection, segment
     }
     guid = JSON.parse(created.body).guid;
     if (!guid) throw new Error('Bunny Stream nevrátil guid videa');
+    bailIfGone();
 
     const result = await new Promise((resolve, reject) => {
       const up = https.request(
@@ -625,6 +642,7 @@ async function handleCutStreamUpload(req, res, creds, title, collection, segment
           );
         }
       );
+      putReq = up;
       up.on('error', reject);
       const rs = fs.createReadStream(cut.outPath);
       rs.on('error', (e) => {
@@ -651,7 +669,7 @@ async function handleCutStreamUpload(req, res, creds, title, collection, segment
       error: `Bunny Stream upload selhal (${result.status}).`,
     });
   } catch (err) {
-    console.error('[stream:cut-error]', err.message);
+    console.error(clientGone ? '[stream:cut-cancelled]' : '[stream:cut-error]', err.message);
     if (guid) {
       streamApi('DELETE', `/library/${creds.library}/videos/${guid}`, creds.key).catch(() => {});
     }

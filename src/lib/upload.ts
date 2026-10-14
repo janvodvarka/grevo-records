@@ -34,13 +34,18 @@ export interface UploadOptions {
    * the proxy cuts it natively before it goes to Bunny Stream.
    */
   segments?: { start: number; end: number }[] | null;
+  /** Aborting it cancels the upload (and stops the server-side cut). */
+  signal?: AbortSignal;
 }
 
 class UploadError extends Error {
-  constructor(message: string, public transient: boolean) {
+  constructor(message: string, public transient: boolean, public cancelled = false) {
     super(message);
   }
 }
+
+/** Thrown (as a plain Error with this name) when the user cancels an upload. */
+export const UPLOAD_CANCELLED = 'UploadCancelled';
 
 /**
  * Uploads a recording to the user's Bunny Stream library via the team
@@ -51,7 +56,8 @@ function singleUploadAttempt(
   blob: Blob,
   filename: string,
   onProgress?: UploadProgress,
-  segments?: { start: number; end: number }[] | null
+  segments?: { start: number; end: number }[] | null,
+  signal?: AbortSignal
 ): Promise<UploadResult> {
   const s = loadBunnySettings();
   if (!s.enabled) {
@@ -75,8 +81,19 @@ function singleUploadAttempt(
       : '');
 
   return new Promise<UploadResult>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new UploadError('Upload zrušen.', false, true));
+      return;
+    }
     const xhr = new XMLHttpRequest();
     xhr.open('POST', url, true);
+    // Cancel: aborting the XHR closes the connection, which the proxy treats
+    // as "stop" — mid-body it deletes the half-made video, mid-cut it never
+    // creates one.
+    const onAbort = () => xhr.abort();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    xhr.onabort = () => reject(new UploadError('Upload zrušen.', false, true));
+    xhr.onloadend = () => signal?.removeEventListener('abort', onAbort);
     xhr.setRequestHeader('x-upload-secret', UPLOAD_SECRET);
     xhr.setRequestHeader('x-stream-library', s.libraryId.trim());
     xhr.setRequestHeader('x-stream-key', s.apiKey.trim());
@@ -215,9 +232,20 @@ export async function uploadToBunny(
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
-      return await singleUploadAttempt(blob, filename, onProgress, options.segments);
+      return await singleUploadAttempt(
+        blob,
+        filename,
+        onProgress,
+        options.segments,
+        options.signal
+      );
     } catch (err) {
       const e = err as UploadError;
+      if ((e instanceof UploadError && e.cancelled) || options.signal?.aborted) {
+        const c = new Error('Upload zrušen.');
+        c.name = UPLOAD_CANCELLED;
+        throw c;
+      }
       const isTransient = e instanceof UploadError ? e.transient : false;
       if (!isTransient || attempt >= maxRetries) {
         throw new Error(e.message);
