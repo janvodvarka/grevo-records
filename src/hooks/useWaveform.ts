@@ -14,7 +14,18 @@ import { useEffect, useMemo, useState } from 'react';
  * asks for anything. The timeline renders fine without peaks; an
  * out-of-memory tab does not.
  */
-const MAX_WAVEFORM_BYTES = 150 * 1024 * 1024;
+const MAX_WAVEFORM_BYTES = 1536 * 1024 * 1024;
+
+/**
+ * Decode rate for the waveform. decodeAudioData resamples to the context's
+ * rate, so an OfflineAudioContext at 8 kHz keeps the decoded PCM ~6x smaller
+ * than a 48 kHz AudioContext would: a 10 min stereo recording is ~38 MB of
+ * samples instead of ~230 MB. Plenty for an amplitude envelope (speech energy
+ * sits well below 4 kHz) and the reason the size cap above can be generous —
+ * the old 150 MB cap hid the waveform on every real-length recording, which
+ * is exactly when it is needed to find the silences to cut at.
+ */
+const WAVEFORM_DECODE_RATE = 8000;
 
 /**
  * Resolution of the cached envelope. The audio is decoded once, reduced to this
@@ -37,29 +48,39 @@ export function useWaveform(blob: Blob | null, samples: number = 240) {
       return;
     }
     let cancelled = false;
-    let ctx: AudioContext | null = null;
 
     (async () => {
       try {
         const buf = await blob.arrayBuffer();
         if (cancelled) return;
-        ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+        const ctx = new OfflineAudioContext(1, 1, WAVEFORM_DECODE_RATE);
         // No defensive slice(): decodeAudioData detaches the buffer, and we
         // never touch it again. The copy just doubled peak memory.
         const audio = await ctx.decodeAudioData(buf);
         if (cancelled) return;
-        setEnvelope(buildEnvelope(audio.getChannelData(0), ENVELOPE_BINS));
-      } catch {
+        // Max across channels, so a mic captured on one side only still shows.
+        const ch0 = audio.getChannelData(0);
+        let mono = ch0;
+        if (audio.numberOfChannels > 1) {
+          mono = new Float32Array(ch0.length);
+          for (let c = 0; c < audio.numberOfChannels; c++) {
+            const d = audio.getChannelData(c);
+            for (let i = 0; i < d.length; i++) {
+              const v = Math.abs(d[i]);
+              if (v > mono[i]) mono[i] = v;
+            }
+          }
+        }
+        setEnvelope(buildEnvelope(mono, ENVELOPE_BINS));
+      } catch (e) {
         // Decoding may fail for some codecs; we just skip the waveform.
+        console.warn('[waveform] decode failed:', e);
         if (!cancelled) setEnvelope(null);
-      } finally {
-        ctx?.close().catch(() => {});
       }
     })();
 
     return () => {
       cancelled = true;
-      ctx?.close().catch(() => {});
     };
   }, [blob]);
 

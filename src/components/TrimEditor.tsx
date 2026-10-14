@@ -865,7 +865,7 @@ export function TrimEditor({
       <TimelineRuler duration={duration} contentWidth={contentWidth} viewport={viewportEl} />
       <div
         ref={trackRef}
-        className={`relative h-28 bg-bg-elev rounded-xl select-none overflow-hidden ${
+        className={`relative h-36 bg-bg-elev rounded-xl select-none overflow-hidden ${
           shiftHeld ? 'cursor-crosshair' : 'cursor-pointer'
         }`}
         onMouseDown={(e) => {
@@ -1089,7 +1089,7 @@ function Shortcut({ keys, desc }: { keys: string; desc: string }) {
 const ThumbnailStrip = memo(function ThumbnailStrip({ thumbnails }: { thumbnails: string[] }) {
   if (thumbnails.length === 0) return null;
   return (
-    <div className="absolute inset-0 flex">
+    <div className="absolute inset-x-0 top-0 h-20 flex">
       {thumbnails.map((src, i) => (
         <div
           key={i}
@@ -1103,22 +1103,30 @@ const ThumbnailStrip = memo(function ThumbnailStrip({ thumbnails }: { thumbnails
 
 /** One <path> instead of thousands of <rect>s; memoized so playback ticks skip it. */
 const Waveform = memo(function Waveform({ peaks }: { peaks: number[] }) {
+  // Own band under the filmstrip, never painted over the video frames, so a
+  // deliberate pause reads as a clear gap. Bars are mirrored around the
+  // centre line: silence collapses to the thin line, speech stands out.
   const d = useMemo(() => {
     let out = '';
     for (let i = 0; i < peaks.length; i++) {
-      const h = Math.max(2, peaks[i] * 100);
-      out += `M${i} ${(100 - h).toFixed(1)}h0.85v${h.toFixed(1)}h-0.85z`;
+      const h = Math.max(1.5, peaks[i] * 96);
+      out += `M${i} ${(50 - h / 2).toFixed(1)}h0.85v${h.toFixed(1)}h-0.85z`;
     }
     return out;
   }, [peaks]);
-  if (peaks.length === 0) return null;
   return (
-    <svg
-      className="absolute inset-x-0 bottom-0 w-full h-12 pointer-events-none"
-      preserveAspectRatio="none"
-      viewBox={`0 0 ${peaks.length} 100`}
-    >
-      <path d={d} fill="rgba(232,163,61,0.7)" />
-    </svg>
+    <div className="absolute inset-x-0 bottom-0 h-16 bg-bg border-t border-bg-border pointer-events-none">
+      {/* centre line: what silence looks like */}
+      <div className="absolute inset-x-0 top-1/2 h-px bg-bg-border" />
+      {peaks.length > 0 && (
+        <svg
+          className="absolute inset-0 w-full h-full"
+          preserveAspectRatio="none"
+          viewBox={`0 0 ${peaks.length} 100`}
+        >
+          <path d={d} fill="rgba(242,242,240,0.85)" />
+        </svg>
+      )}
+    </div>
   );
 });
