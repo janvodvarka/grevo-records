@@ -171,7 +171,14 @@ function singleUploadAttempt(
 export interface StreamStatus {
   state: 'processing' | 'ready' | 'error';
   encodeProgress: number;
+  /** Raw Bunny status code (0 Created … 4 Finished); -1 when the video is gone. */
+  code?: number;
 }
+
+// Bunny moves a video out of "Created" (0) the moment its bytes land. One
+// that stays there after we were told the upload succeeded never got its
+// data — it would show "Processing" in the library forever.
+const STUCK_CREATED_MS = 3 * 60 * 1000;
 
 /** One-shot check of a Stream video's transcode status via the proxy. */
 export async function fetchStreamStatus(guid: string): Promise<StreamStatus> {
@@ -185,10 +192,16 @@ export async function fetchStreamStatus(guid: string): Promise<StreamStatus> {
     },
   });
   const data = await res.json().catch(() => null);
+  // Deleted in the Bunny library (by hand or by the proxy's cleanup).
+  if (res.status === 404) return { state: 'error', encodeProgress: 0, code: -1 };
   if (!res.ok || !data?.ok) {
     throw new Error(data?.error || `Status ${res.status}`);
   }
-  return { state: data.state, encodeProgress: data.encodeProgress ?? 0 };
+  return {
+    state: data.state,
+    encodeProgress: data.encodeProgress ?? 0,
+    code: typeof data.code === 'number' ? data.code : undefined,
+  };
 }
 
 /**
@@ -205,10 +218,21 @@ export async function pollStreamStatus(
   const deadline = Date.now() + (opts.timeoutMs ?? 20 * 60 * 1000);
   // A few consecutive read failures shouldn't abort a long transcode.
   let misses = 0;
+  let createdSince = 0;
   while (!opts.signal?.aborted) {
     try {
       const s = await fetchStreamStatus(guid);
       misses = 0;
+      if (s.code === 0) {
+        createdSince ||= Date.now();
+        if (Date.now() - createdSince > STUCK_CREATED_MS) {
+          const stuck: StreamStatus = { state: 'error', encodeProgress: 0, code: 0 };
+          onUpdate(stuck);
+          return stuck;
+        }
+      } else {
+        createdSince = 0;
+      }
       onUpdate(s);
       if (s.state === 'ready' || s.state === 'error') return s;
     } catch {

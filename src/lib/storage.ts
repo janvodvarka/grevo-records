@@ -171,6 +171,19 @@ export async function setRecordingEdits(
   return rec;
 }
 
+/** Forgets the Bunny copy so the recording can be uploaded again. */
+export async function clearUpload(id: string): Promise<StoredRecording | null> {
+  const store = await tx('readwrite');
+  const rec = await req<StoredRecording | undefined>(store.get(id));
+  if (!rec) return null;
+  rec.uploadedUrl = undefined;
+  rec.uploadedAt = undefined;
+  rec.streamGuid = undefined;
+  rec.streamStatus = undefined;
+  await req(store.put(rec));
+  return rec;
+}
+
 /** Update the Bunny encode status once polling learns the outcome. */
 export async function setStreamStatus(
   id: string,

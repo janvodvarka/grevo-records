@@ -9,18 +9,21 @@ import {
   CheckCircle2,
   AlertTriangle,
   X,
+  RotateCcw,
 } from 'lucide-react';
 import type { StoredRecording } from '../types';
 import { renameRecording } from '../lib/storage';
 import { isBunnyConfigured } from '../lib/settings';
 import { formatBytes } from '../lib/format';
 import { toast } from '../lib/toast';
-import { promptDialog } from '../lib/confirm';
+import { confirmDialog, promptDialog } from '../lib/confirm';
 import {
   cancelUpload,
   enqueueUpload,
   isActive,
   latestJobFor,
+  reupload,
+  streamProgressFor,
   useUploadJobs,
   watchStreamStatus,
 } from '../lib/uploads';
@@ -106,6 +109,25 @@ export function UploadButton({ recording, variant = 'secondary', onUploaded }: P
 
     enqueueUpload({ ...recording, name: uploadName }, uploadName);
     toast.info('Upload běží na pozadí. Můžeš mezitím dál pracovat.', { duration: 4000 });
+  };
+
+  const handleReupload = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!configured) return;
+    if (streamState === 'ready') {
+      const ok = await confirmDialog({
+        title: 'Nahrát znovu?',
+        message:
+          'Vznikne nové video s novým odkazem. To současné v Bunny zůstane, ' +
+          'odkazy, které už jsi poslal, budou dál fungovat.',
+        confirmLabel: 'Nahrát znovu',
+      });
+      if (!ok) return;
+    }
+    await reupload(recording);
+    toast.info('Nahrávám znovu na pozadí. Prázdné nebo rozbité video v Bunny klidně smaž.', {
+      duration: 5000,
+    });
   };
 
   const copyLink = async (e: React.MouseEvent) => {
@@ -210,7 +232,10 @@ export function UploadButton({ recording, variant = 'secondary', onUploaded }: P
         {streamState === 'processing' ? (
           <>
             <Loader2 className="w-4 h-4 text-accent animate-spin" />
-            <span className="text-sm text-accent">Bunny zpracovává…</span>
+            <span className="text-sm text-accent">
+              Bunny zpracovává…
+              {streamProgressFor(recording.id) ? ` ${Math.round(streamProgressFor(recording.id)!)} %` : ''}
+            </span>
           </>
         ) : streamState === 'error' ? (
           <>
@@ -245,6 +270,13 @@ export function UploadButton({ recording, variant = 'secondary', onUploaded }: P
         >
           <ExternalLink className="w-3.5 h-3.5" /> Otevřít
         </a>
+        <button
+          onClick={handleReupload}
+          className={streamState === 'error' ? 'btn-primary px-2.5 py-1 text-xs' : 'btn-ghost p-1.5 text-xs'}
+          title="Nahrát video na Bunny znovu (nový odkaz)"
+        >
+          <RotateCcw className="w-3.5 h-3.5" /> Nahrát znovu
+        </button>
       </div>
     );
   }

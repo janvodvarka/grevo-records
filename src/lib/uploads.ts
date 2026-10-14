@@ -12,7 +12,7 @@
 
 import { useEffect, useState } from 'react';
 import type { StoredRecording } from '../types';
-import { getRecording, setStreamStatus, setUploadedUrl } from './storage';
+import { clearUpload, getRecording, setStreamStatus, setUploadedUrl } from './storage';
 import { pollStreamStatus, uploadToBunny, UPLOAD_CANCELLED } from './upload';
 import { keptSegments } from './edits';
 import { toast } from './toast';
@@ -103,6 +103,19 @@ export function onRecordingUpdated(fn: (rec: StoredRecording) => void): () => vo
 
 function announce(rec: StoredRecording) {
   for (const l of recordingListeners) l(rec);
+}
+
+/**
+ * Drops the Bunny copy the app knows about and uploads the recording again
+ * (a broken or stuck video in the library). The old video is not deleted
+ * here: if it was fine, links already sent keep working.
+ */
+export async function reupload(rec: StoredRecording): Promise<string> {
+  const cleared = (await clearUpload(rec.id)) ?? rec;
+  streamProgress.delete(rec.id);
+  jobs = jobs.filter((j) => j.recordingId !== rec.id || isActive(j));
+  announce(cleared);
+  return enqueueUpload(cleared, cleared.name);
 }
 
 /** Queues an upload; returns the job id (the existing one if already queued). */
@@ -217,12 +230,25 @@ async function runJob(id: string) {
 // Bunny encode-status polling lives here too, so the "link je připravený"
 // notice arrives even when the user is on another screen.
 const polling = new Set<string>();
+// Last known Bunny encode progress per recording, so "zpracovává" shows
+// whether it is actually moving.
+const streamProgress = new Map<string, number>();
+
+export function streamProgressFor(recordingId: string): number | undefined {
+  return streamProgress.get(recordingId);
+}
 
 export function watchStreamStatus(recordingId: string, guid: string, name?: string) {
   if (polling.has(recordingId)) return;
   polling.add(recordingId);
-  pollStreamStatus(guid, () => {})
+  pollStreamStatus(guid, (s) => {
+    if (s.state !== 'processing') return;
+    streamProgress.set(recordingId, s.encodeProgress);
+    emit();
+  })
     .then(async (final) => {
+      streamProgress.delete(recordingId);
+      emit();
       if (final.state === 'processing') return; // timed out, leave as is
       const updated = await setStreamStatus(recordingId, final.state).catch(() => null);
       if (updated) announce(updated);
@@ -237,7 +263,13 @@ export function watchStreamStatus(recordingId: string, guid: string, name?: stri
           title: 'Hotovo',
         });
       } else {
-        toast.error(`${name ?? 'Video'}: Bunny hlásí chybu při zpracování. Zkus ho nahrát znovu.`, {
+        const why =
+          final.code === 0
+            ? 'do Bunny nedorazila data, video zůstalo prázdné'
+            : final.code === -1
+            ? 'video už v Bunny knihovně není'
+            : 'Bunny hlásí chybu při zpracování';
+        toast.error(`${name ?? 'Video'}: ${why}. Klikni na „Nahrát znovu“.`, {
           title: 'Zpracování selhalo',
         });
       }
