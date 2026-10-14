@@ -2,7 +2,7 @@
 // Each recording is one row: id, name, createdAt, size, mimeType, durationMs, blob.
 // Recordings are filtered by ownerEmail so each logged-in user sees only their own.
 
-import type { StoredRecording } from '../types';
+import type { RecordingEdits, StoredRecording } from '../types';
 import { currentSession } from './auth';
 
 const DB_NAME = 'video-recorder';
@@ -141,6 +141,32 @@ export async function setUploadedUrl(
   rec.uploadedAt = Date.now();
   if (streamGuid) rec.streamGuid = streamGuid;
   rec.streamStatus = 'processing';
+  await req(store.put(rec));
+  return rec;
+}
+
+/**
+ * Saves (or clears, with null) the non-destructive cut. Instant: only the
+ * edit list is written, the original blob is untouched. If the cut actually
+ * changed and the recording was already on Bunny, that copy no longer
+ * matches, so the upload state is cleared and the user can re-upload.
+ */
+export async function setRecordingEdits(
+  id: string,
+  edits: RecordingEdits | null
+): Promise<StoredRecording | null> {
+  const store = await tx('readwrite');
+  const rec = await req<StoredRecording | undefined>(store.get(id));
+  if (!rec) return null;
+  const before = JSON.stringify(rec.edits?.segments ?? null);
+  const after = JSON.stringify(edits?.segments ?? null);
+  rec.edits = edits ?? undefined;
+  if (before !== after && rec.uploadedUrl) {
+    rec.uploadedUrl = undefined;
+    rec.uploadedAt = undefined;
+    rec.streamGuid = undefined;
+    rec.streamStatus = undefined;
+  }
   await req(store.put(rec));
   return rec;
 }

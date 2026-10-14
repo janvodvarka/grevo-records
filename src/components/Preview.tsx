@@ -17,6 +17,7 @@ import { UploadButton } from './UploadButton';
 import { ConvertMp4Button } from './ConvertMp4Button';
 import { confirmDialog } from '../lib/confirm';
 import { toast } from '../lib/toast';
+import { keptSegments, editedDurationMs, materialize } from '../lib/edits';
 
 interface Props {
   recording: StoredRecording;
@@ -99,13 +100,32 @@ export function Preview({ recording, onBack, onNew, onUpdated, onDeleted }: Prop
     }
   };
 
-  const handleDownload = () => {
-    downloadBlob(recording.blob, recording.name);
+  // With a saved cut the download is the cut version, rendered here in the
+  // browser — the one remaining slow path (uploads are cut on the server).
+  const [dlPct, setDlPct] = useState<number | null>(null);
+  const handleDownload = async () => {
+    if (!keptSegments(recording)) {
+      downloadBlob(recording.blob, recording.name);
+      return;
+    }
+    setDlPct(0);
+    try {
+      const { blob, name } = await materialize(recording, (pct) => setDlPct(pct));
+      downloadBlob(blob, name);
+    } catch (e) {
+      toast.error('Export sestříhaného videa selhal: ' + (e as Error).message, {
+        title: 'Stažení',
+      });
+    } finally {
+      setDlPct(null);
+    }
   };
+  /** The untouched original — used when the video cannot even be played. */
+  const handleDownloadOriginal = () => downloadBlob(recording.blob, recording.name);
 
   return (
     <div className="min-h-full p-4 sm:p-6 lg:p-8 max-w-[1600px] mx-auto animate-fade-in">
-      <header className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4 mb-5 pt-2">
+      <header className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 lg:gap-4 mb-5 pt-2">
         <div className="flex items-center gap-3 min-w-0 flex-1">
           <button onClick={onBack} className="btn-ghost p-2">
             <ArrowLeft className="w-5 h-5" />
@@ -164,15 +184,23 @@ export function Preview({ recording, onBack, onNew, onUpdated, onDeleted }: Prop
             )}
             <div className="text-xs text-text-muted mt-1">
               {formatDate(recording.createdAt)} · {formatBytes(recording.size)}
-              {duration > 0 && ` · ${formatDuration(duration)}`}
+              {keptSegments(recording)
+                ? ` · ${formatDuration(editedDurationMs(recording) / 1000)} po střihu`
+                : duration > 0 && ` · ${formatDuration(duration)}`}
             </div>
           </div>
         </div>
-        <div className="flex items-center gap-2 shrink-0 flex-wrap sm:justify-end w-full sm:w-auto">
+        <div className="flex items-center gap-2 shrink-0 flex-wrap lg:justify-end w-full lg:w-auto">
           <ConvertMp4Button recording={recording} onConverted={onUpdated} />
           <UploadButton recording={recording} variant="secondary" onUploaded={onUpdated} />
-          <button onClick={handleDownload} className="btn-secondary">
-            <Download className="w-4 h-4" /> Stáhnout
+          <button
+            onClick={handleDownload}
+            disabled={dlPct !== null}
+            className="btn-secondary"
+            title={keptSegments(recording) ? 'Stáhne sestříhanou verzi (vyrobí se v prohlížeči)' : undefined}
+          >
+            <Download className="w-4 h-4" />{' '}
+            {dlPct !== null ? `Připravuji… ${Math.round(dlPct)} %` : 'Stáhnout'}
           </button>
           <button onClick={onNew} className="btn-ghost">
             <Plus className="w-4 h-4" /> Nové
@@ -250,7 +278,7 @@ export function Preview({ recording, onBack, onNew, onUpdated, onDeleted }: Prop
             <div className="text-center max-w-md">
               <div className="text-danger font-medium mb-2">Chyba přehrávání</div>
               <p className="text-sm text-text-secondary mb-4">{playbackError}</p>
-              <button onClick={handleDownload} className="btn-primary">
+              <button onClick={handleDownloadOriginal} className="btn-primary">
                 <Download className="w-4 h-4" /> Stáhnout soubor
               </button>
             </div>

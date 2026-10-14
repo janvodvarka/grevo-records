@@ -16,6 +16,7 @@ import { isBunnyConfigured } from '../lib/settings';
 import { formatBytes } from '../lib/format';
 import { toast } from '../lib/toast';
 import { promptDialog } from '../lib/confirm';
+import { keptSegments } from '../lib/edits';
 
 interface Props {
   recording: StoredRecording;
@@ -139,6 +140,8 @@ export function UploadButton({ recording, variant = 'secondary', onUploaded }: P
         (loaded, total, pct) =>
           setState({ kind: 'uploading', loaded, total, pct }),
         {
+          // Saved cut is applied on the server, natively, during this upload.
+          segments: keptSegments(recording),
           onRetry: (attempt, reason) =>
             toast.warning(`Pokus ${attempt} selhal (${reason}). Zkouším znovu…`, {
               title: 'Upload retry',
@@ -272,9 +275,11 @@ export function UploadButton({ recording, variant = 'secondary', onUploaded }: P
         <div className="flex items-center gap-2 text-sm">
           <Loader2 className="w-4 h-4 animate-spin text-accent" />
           <span>
-            {`Nahrávám… ${Math.round(state.pct)}% (${formatBytes(
-              state.loaded
-            )} / ${formatBytes(state.total)})`}
+            {state.pct >= 100 && keptSegments(recording)
+              ? 'Server stříhá video…'
+              : `Nahrávám… ${Math.round(state.pct)}% (${formatBytes(
+                  state.loaded
+                )} / ${formatBytes(state.total)})`}
           </span>
         </div>
         <div className="w-full h-1.5 bg-bg-elev rounded-full overflow-hidden">

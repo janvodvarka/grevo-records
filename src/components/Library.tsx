@@ -14,6 +14,7 @@ import {
   Eraser,
   Loader2,
   ShieldCheck,
+  Scissors,
 } from 'lucide-react';
 import type { StoredRecording } from '../types';
 import { formatBytes, formatDate, formatDuration } from '../lib/format';
@@ -21,6 +22,7 @@ import { listRecordings, deleteRecording, estimateStorage } from '../lib/storage
 import { downloadBlob } from '../lib/download';
 import { UploadButton } from './UploadButton';
 import { confirmDialog } from '../lib/confirm';
+import { keptSegments, editedDurationMs, materialize } from '../lib/edits';
 import { toast } from '../lib/toast';
 
 type FilterMode = 'all' | 'uploaded' | 'local';
@@ -184,19 +186,41 @@ export function Library({ onOpen }: Props) {
     }
   };
 
+  // Recordings with a saved cut download as the cut version, which is rendered
+  // in the browser first; uncut ones download instantly as before.
+  const downloadOne = async (rec: StoredRecording) => {
+    if (!keptSegments(rec)) {
+      downloadBlob(rec.blob, rec.name);
+      return;
+    }
+    toast.info(`Připravuji sestříhanou verzi: ${rec.name}`, { duration: 4000 });
+    const { blob, name } = await materialize(rec);
+    downloadBlob(blob, name);
+  };
+
   const handleBulkDownload = async () => {
     const items = recordings.filter((r) => selected.has(r.id));
+    let failed = 0;
     for (const rec of items) {
-      downloadBlob(rec.blob, rec.name);
+      try {
+        await downloadOne(rec);
+      } catch {
+        failed++;
+      }
       // Stagger to avoid browser blocking multiple downloads
       await new Promise((r) => setTimeout(r, 200));
     }
-    toast.success(`Stahuje se ${items.length} souborů.`);
+    if (failed === 0) toast.success(`Staženo ${items.length} souborů.`);
+    else toast.warning(`Staženo ${items.length - failed} z ${items.length}.`);
   };
 
   const handleDownload = (rec: StoredRecording, e: React.MouseEvent) => {
     e.stopPropagation();
-    downloadBlob(rec.blob, rec.name);
+    downloadOne(rec).catch((err) =>
+      toast.error('Export sestříhaného videa selhal: ' + (err as Error).message, {
+        title: 'Stažení',
+      })
+    );
   };
 
   const handleCardClick = (rec: StoredRecording, e: React.MouseEvent) => {
@@ -502,8 +526,12 @@ function RecordingCard({
           )
         )}
         {rec.durationMs > 0 && (
-          <span className="absolute bottom-2 right-2 px-2 py-0.5 rounded-md bg-black/70 text-xs font-mono">
-            {formatDuration(rec.durationMs / 1000)}
+          <span
+            className="absolute bottom-2 right-2 px-2 py-0.5 rounded-md bg-black/70 text-xs font-mono inline-flex items-center gap-1"
+            title={keptSegments(rec) ? `Sestříháno z ${formatDuration(rec.durationMs / 1000)}` : undefined}
+          >
+            {keptSegments(rec) && <Scissors className="w-3 h-3" />}
+            {formatDuration(editedDurationMs(rec) / 1000)}
           </span>
         )}
         {hovering && (

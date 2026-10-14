@@ -1,4 +1,5 @@
 import { loadBunnySettings } from './settings';
+import { segmentsParam } from './edits';
 import { PROXY_URL, UPLOAD_SECRET } from './proxy-config';
 
 export interface UploadResult {
@@ -28,6 +29,11 @@ export interface UploadOptions {
   maxRetries?: number;
   /** Called once after each failed attempt before retry. */
   onRetry?: (attempt: number, reason: string) => void;
+  /**
+   * Kept segments of a non-destructive cut. The original is uploaded and
+   * the proxy cuts it natively before it goes to Bunny Stream.
+   */
+  segments?: { start: number; end: number }[] | null;
 }
 
 class UploadError extends Error {
@@ -44,7 +50,8 @@ class UploadError extends Error {
 function singleUploadAttempt(
   blob: Blob,
   filename: string,
-  onProgress?: UploadProgress
+  onProgress?: UploadProgress,
+  segments?: { start: number; end: number }[] | null
 ): Promise<UploadResult> {
   const s = loadBunnySettings();
   if (!s.enabled) {
@@ -62,6 +69,9 @@ function singleUploadAttempt(
     `${base}/upload-stream?name=${encodeURIComponent(filename)}` +
     (s.collectionId.trim()
       ? `&collection=${encodeURIComponent(s.collectionId.trim())}`
+      : '') +
+    (segments && segments.length > 0
+      ? `&segments=${encodeURIComponent(segmentsParam(segments))}`
       : '');
 
   return new Promise<UploadResult>((resolve, reject) => {
@@ -205,7 +215,7 @@ export async function uploadToBunny(
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
-      return await singleUploadAttempt(blob, filename, onProgress);
+      return await singleUploadAttempt(blob, filename, onProgress, options.segments);
     } catch (err) {
       const e = err as UploadError;
       const isTransient = e instanceof UploadError ? e.transient : false;

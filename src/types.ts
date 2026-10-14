@@ -3,6 +3,21 @@ export interface MediaDevice {
   label: string;
 }
 
+/**
+ * Non-destructive cut of a recording (the Loom model): the original blob is
+ * never rewritten when the user saves. Playback skips the removed parts and
+ * the real cut happens on the server during upload (or in the browser when
+ * the user downloads the file).
+ */
+export interface RecordingEdits {
+  trimStart: number;
+  trimEnd: number;
+  deletes: { start: number; end: number }[];
+  /** Kept parts in source seconds: what plays, and what the server cuts to. */
+  segments: { start: number; end: number }[];
+  updatedAt: number;
+}
+
 export interface StoredRecording {
   id: string;
   name: string;
@@ -23,4 +38,6 @@ export interface StoredRecording {
    * 'ready' once transcoded (link is safe to send), 'error' on failure.
    */
   streamStatus?: 'processing' | 'ready' | 'error';
+  /** Saved cut, if any. Absent = the whole recording. */
+  edits?: RecordingEdits;
 }

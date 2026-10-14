@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { cutToFile, parseSegments } from './cut.js';
 
 const {
   UPLOAD_SECRET,
@@ -430,6 +431,17 @@ app.post('/upload-stream', async (req, res) => {
     'recording';
   const collection = String(req.query.collection || '').trim();
 
+  // Edits are non-destructive in the app: when the user has cut the video,
+  // the original arrives here with the kept segments and is cut natively.
+  const rawSegments = String(req.query.segments || '').trim();
+  if (rawSegments) {
+    const segments = parseSegments(rawSegments);
+    if (!segments) {
+      return res.status(400).json({ ok: false, error: 'Neplatný seznam úseků střihu.' });
+    }
+    return handleCutStreamUpload(req, res, creds, title, collection, segments);
+  }
+
   // 1) Create the video object (gets us the guid to upload into)
   let guid;
   try {
@@ -540,6 +552,119 @@ app.post('/upload-stream', async (req, res) => {
 
   req.pipe(uploadReq);
 });
+
+// ────── Upload with a server-side cut ──────
+// Body -> temp file -> native cut (see cut.js) -> create the Stream video ->
+// PUT the cut file. The video object is created only after the cut succeeds,
+// so a failed cut never leaves an empty video in the user's library.
+async function handleCutStreamUpload(req, res, creds, title, collection, segments) {
+  const workDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'rbg-cut-'));
+  const ct = String(req.headers['content-type'] || '');
+  const inPath = path.join(workDir, 'in' + (/webm/i.test(ct) ? '.webm' : /mp4/i.test(ct) ? '.mp4' : ''));
+  let guid = null;
+  try {
+    const t0 = Date.now();
+    await new Promise((resolve, reject) => {
+      const ws = fs.createWriteStream(inPath);
+      ws.on('finish', resolve);
+      ws.on('error', reject);
+      req.on('error', reject);
+      req.on('aborted', () => {
+        ws.destroy();
+        reject(new Error('Upload přerušen'));
+      });
+      req.pipe(ws);
+    });
+    const inSize = (await fsp.stat(inPath)).size;
+    console.log(
+      `[stream:cut] received ${inSize} B in ${((Date.now() - t0) / 1000).toFixed(1)}s, ` +
+        `${segments.length} segment(s)`
+    );
+
+    const cut = await cutToFile(inPath, segments, workDir);
+    const outSize = (await fsp.stat(cut.outPath)).size;
+    console.log(`[stream:cut] ${cut.mode} cut in ${cut.ms} ms -> ${outSize} B`);
+
+    const created = await streamApi(
+      'POST',
+      `/library/${creds.library}/videos`,
+      creds.key,
+      { title, ...(collection ? { collectionId: collection } : {}) }
+    );
+    if (created.status < 200 || created.status >= 300) {
+      console.warn(`[stream:cut-create-fail] ${created.status} ${created.body.slice(0, 200)}`);
+      return res.status(created.status === 401 ? 401 : 502).json({
+        ok: false,
+        error:
+          `Bunny Stream: vytvoření videa selhalo (${created.status}).` +
+          (created.status === 401 ? ' Zkontroluj Library ID a API klíč.' : ''),
+      });
+    }
+    guid = JSON.parse(created.body).guid;
+    if (!guid) throw new Error('Bunny Stream nevrátil guid videa');
+
+    const result = await new Promise((resolve, reject) => {
+      const up = https.request(
+        `https://video.bunnycdn.com/library/${creds.library}/videos/${guid}`,
+        {
+          method: 'PUT',
+          headers: {
+            AccessKey: creds.key,
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': outSize,
+          },
+        },
+        (upRes) => {
+          const chunks = [];
+          upRes.on('data', (c) => chunks.push(c));
+          upRes.on('end', () =>
+            resolve({
+              status: upRes.statusCode || 0,
+              body: Buffer.concat(chunks).toString('utf8'),
+            })
+          );
+        }
+      );
+      up.on('error', reject);
+      const rs = fs.createReadStream(cut.outPath);
+      rs.on('error', (e) => {
+        up.destroy(e);
+        reject(e);
+      });
+      rs.pipe(up);
+    });
+
+    if (result.status >= 200 && result.status < 300) {
+      return res.json({
+        ok: true,
+        guid,
+        libraryId: creds.library,
+        url: `https://iframe.mediadelivery.net/play/${creds.library}/${guid}`,
+        embedUrl: `https://iframe.mediadelivery.net/embed/${creds.library}/${guid}`,
+        cut: { mode: cut.mode, ms: cut.ms },
+      });
+    }
+    console.warn(`[stream:cut-upload-fail] ${result.status} ${result.body.slice(0, 200)}`);
+    streamApi('DELETE', `/library/${creds.library}/videos/${guid}`, creds.key).catch(() => {});
+    return res.status(result.status || 502).json({
+      ok: false,
+      error: `Bunny Stream upload selhal (${result.status}).`,
+    });
+  } catch (err) {
+    console.error('[stream:cut-error]', err.message);
+    if (guid) {
+      streamApi('DELETE', `/library/${creds.library}/videos/${guid}`, creds.key).catch(() => {});
+    }
+    if (!res.headersSent) {
+      res.status(String(err.message).startsWith('cut:') ? 422 : 502).json({
+        ok: false,
+        error: `Střih na serveru selhal: ${err.message}`.slice(0, 400),
+      });
+    }
+  } finally {
+    await fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
 
 // ────── Bunny Stream encode status ──────
 // Bunny status codes: 0 Created, 1 Uploaded, 2 Processing, 3 Transcoding,

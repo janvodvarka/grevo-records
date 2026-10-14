@@ -20,7 +20,7 @@ import { saveRecording } from '../lib/storage';
 import { computeKeptSegments, type Segment } from '../lib/compose';
 import { cancelConversion, trimToMp4 } from '../lib/ffmpeg';
 import { SERVER_CONVERT_THRESHOLD_BYTES } from '../lib/upload';
-import { replaceRecordingBlob } from '../lib/storage';
+import { setRecordingEdits } from '../lib/storage';
 import { confirmDialog } from '../lib/confirm';
 import { useThumbnails } from '../hooks/useThumbnails';
 import { useWaveform } from '../hooks/useWaveform';
@@ -82,9 +82,28 @@ export function TrimEditor({
   onCancel,
   persistent = false,
 }: Props) {
-  const [trimStart, setTrimStart] = useState(0);
-  const [trimEnd, setTrimEnd] = useState(duration);
-  const [deletes, setDeletes] = useState<DeleteRegion[]>([]);
+  // Start from the saved non-destructive cut, if any, so reopening a
+  // recording shows (and plays) exactly what was saved.
+  const saved = recording.edits;
+  const [trimStart, setTrimStart] = useState(() =>
+    saved ? Math.max(0, Math.min(saved.trimStart, duration)) : 0
+  );
+  const [trimEnd, setTrimEnd] = useState(() =>
+    saved ? Math.max(0, Math.min(saved.trimEnd, duration)) : duration
+  );
+  const [deletes, setDeletes] = useState<DeleteRegion[]>(() =>
+    (saved?.deletes ?? []).map((d) => ({ id: genId(), start: d.start, end: d.end }))
+  );
+  // Another recording opened in the same editor: load its cut.
+  const loadedIdRef = useRef(recording.id);
+  useEffect(() => {
+    if (loadedIdRef.current === recording.id) return;
+    loadedIdRef.current = recording.id;
+    const e = recording.edits;
+    setTrimStart(e ? Math.max(0, Math.min(e.trimStart, duration)) : 0);
+    setTrimEnd(e ? Math.max(0, Math.min(e.trimEnd, duration)) : duration);
+    setDeletes((e?.deletes ?? []).map((d) => ({ id: genId(), start: d.start, end: d.end })));
+  }, [recording.id, recording.edits, duration]);
   const [playhead, setPlayhead] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
@@ -708,30 +727,39 @@ export function TrimEditor({
     }
   };
 
+  // "Uložit změny" is non-destructive and instant (the Loom model): only the
+  // list of kept segments is stored. Nothing is re-encoded here — the editor
+  // already plays the cut by skipping removed parts, and the actual cut is
+  // done natively on the server when the video is uploaded. Previously this
+  // re-rendered the whole recording in ffmpeg.wasm, which on a 10 minute
+  // WebM took tens of minutes.
   const handleOverwrite = async () => {
-    const ok = await confirmDialog({
-      title: 'Přepsat původní nahrávku?',
-      message:
-        'Původní verze bude nahrazena střihem a nepůjde vrátit. Pokud byla na Bunny, starý link přestane odpovídat obsahu. Nahraj ji znovu.',
-      confirmLabel: 'Přepsat',
-      danger: true,
-    });
-    if (!ok) return;
-    const result = await exportTrimmed();
-    if (!result) return;
     try {
-      const updated = await replaceRecordingBlob(recording.id, {
-        blob: result.blob,
-        mimeType: 'video/mp4',
-        durationMs: result.durationMs,
-      });
+      const edits = isUncut
+        ? null
+        : {
+            trimStart,
+            trimEnd,
+            deletes: deletes.map((d) => ({ start: d.start, end: d.end })),
+            segments: currentSegs,
+            updatedAt: Date.now(),
+          };
+      const updated = await setRecordingEdits(recording.id, edits);
       if (!updated) throw new Error('Nahrávka nenalezena.');
-      toast.success('Změny uloženy do původní nahrávky (MP4).');
+      toast.success(
+        edits
+          ? `Střih uložen, výsledná délka ${formatDuration(keptDuration)}. Originál zůstává, kdykoli ho můžeš upravit.`
+          : 'Střih zrušen, nahrávka je zase celá.'
+      );
+      if (playbackRate !== 1) {
+        toast.info(
+          'Rychlost přehrávání se do střihu neukládá. Pro zrychlené video použij „Uložit jako novou".',
+          { duration: 7000 }
+        );
+      }
       onDone(updated);
     } catch (e) {
-      toast.error('Uložení selhalo: ' + (e as Error).message, { title: 'Chyba' });
-    } finally {
-      setExporting(false);
+      toast.error('Uložení střihu selhalo: ' + (e as Error).message, { title: 'Chyba' });
     }
   };
 
@@ -746,6 +774,16 @@ export function TrimEditor({
     trimEnd < duration - 0.01 ||
     deletes.length > 0 ||
     playbackRate !== 1;
+
+  // The cut as it would be saved, and whether it differs from what is saved.
+  const currentSegs = kept.map((k) => ({
+    start: Math.round(k.start * 1000) / 1000,
+    end: Math.round(k.end * 1000) / 1000,
+  }));
+  const isUncut =
+    kept.length === 1 && kept[0].start < 0.01 && kept[0].end > duration - 0.01;
+  const savedSegsKey = JSON.stringify(recording.edits?.segments ?? null);
+  const cutDirty = JSON.stringify(isUncut ? null : currentSegs) !== savedSegsKey;
 
   return (
     <div className="card p-5">
@@ -1046,28 +1084,28 @@ export function TrimEditor({
             </button>
           )}
           <button
-            onClick={handleOverwrite}
+            onClick={handleSaveAsNew}
             disabled={exporting || !hasChanges || keptDuration < 0.2}
             className="btn-secondary"
             title={
               !hasChanges
                 ? 'Není co stříhat. Pohni úchyty nebo přidej výřez'
-                : 'Přepsat původní nahrávku střihem (nevratné)'
-            }
-          >
-            <Save className="w-4 h-4" /> Uložit změny
-          </button>
-          <button
-            onClick={handleSaveAsNew}
-            disabled={exporting || !hasChanges || keptDuration < 0.2}
-            className="btn-primary"
-            title={
-              !hasChanges
-                ? 'Není co stříhat. Pohni úchyty nebo přidej výřez'
-                : 'Uložit jako novou nahrávku, originál zůstane'
+                : 'Vyrobí nový samostatný soubor (počítá se v prohlížeči, u dlouhých videí trvá)'
             }
           >
             <Check className="w-4 h-4" /> Uložit jako novou
+          </button>
+          <button
+            onClick={handleOverwrite}
+            disabled={exporting || !cutDirty || keptDuration < 0.2}
+            className="btn-primary"
+            title={
+              !cutDirty
+                ? 'Střih je uložený. Pohni úchyty nebo přidej výřez'
+                : 'Uloží střih okamžitě. Originál zůstává a dá se kdykoli upravit'
+            }
+          >
+            <Save className="w-4 h-4" /> Uložit změny
           </button>
         </div>
       </div>
