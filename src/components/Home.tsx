@@ -247,7 +247,7 @@ function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void 
         className={`absolute top-0.5 w-4 h-4 rounded-full bg-[#111013] transition-all ${
           on ? 'left-[18px]' : 'left-0.5'
         }`}
-        style={{ background: on ? '#1A1408' : '#6C6772' }}
+        style={{ background: on ? '#141416' : '#6C6772' }}
       />
     </button>
   );

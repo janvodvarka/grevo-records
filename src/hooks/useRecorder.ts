@@ -234,6 +234,7 @@ export function useRecorder(): UseRecorderReturn {
   // copied console line, which is why past reports never said what failed.
   const recorderErrorDetailRef = useRef<string>('');
   const retriedWebmRef = useRef(false);
+  const retriedResampleRef = useRef(false);
   const autoResultRef = useRef<StopResult | null>(null);
 
   const stopAllStreams = useCallback(() => {
@@ -291,6 +292,7 @@ export function useRecorder(): UseRecorderReturn {
       cancelledRef.current = false;
       recorderErrorRef.current = false;
       retriedWebmRef.current = false;
+      retriedResampleRef.current = false;
       autoResultRef.current = null;
       setState('preparing');
       try {
@@ -399,8 +401,12 @@ export function useRecorder(): UseRecorderReturn {
         // failed 6/6 in Chrome 154, the same track resampled to 48 kHz passed
         // 6/6. So off-spec mic rates go through Web Audio at 48 kHz.
         const micRate = micTrack?.getSettings().sampleRate;
+        // Unknown rate counts as unsafe. getSettings().sampleRate can come
+        // back undefined, and the old `!!micRate &&` guard then read that as
+        // "fine" and fed the raw track to the AAC encoder — exactly the case
+        // that fails with "the given encoder configuration is not supported".
         const needsResample =
-          !!micTrack && !!micRate && !AAC_SAFE_SAMPLE_RATES.includes(micRate);
+          !!micTrack && !(micRate && AAC_SAFE_SAMPLE_RATES.includes(micRate));
         if (needsResample) {
           console.warn(
             `[recorder] mic runs at ${micRate} Hz, which the MP4/AAC encoder rejects; resampling to 48 kHz`
@@ -643,6 +649,60 @@ export function useRecorder(): UseRecorderReturn {
               //    retry while there is nothing worth keeping.
               const errorCameLate =
                 blob.size > 0 && durationMs > RETRY_ONLY_WITHIN_MS;
+              // Before giving up on MP4, try it once more with the audio
+              // rebuilt at 48 kHz. Chrome's AAC encoder rejects some mic
+              // configurations outright, and the rate is not always knowable
+              // up front, so the proactive check above cannot catch every
+              // case. Swapping only the audio keeps the screen capture alive.
+              if (
+                recorderErrorRef.current &&
+                !retriedResampleRef.current &&
+                !errorCameLate &&
+                effectiveMime.includes('mp4') &&
+                combined.getAudioTracks().length > 0
+              ) {
+                recorderErrorRef.current = false;
+                retriedResampleRef.current = true;
+                clearBuffer();
+                try {
+                  const ctx = new AudioContext({ sampleRate: 48000 });
+                  audioCtxRef.current?.close().catch(() => {});
+                  audioCtxRef.current = ctx;
+                  const dest = ctx.createMediaStreamDestination();
+                  const dispAudio = displayMS.getAudioTracks();
+                  if (dispAudio.length > 0) {
+                    ctx
+                      .createMediaStreamSource(new MediaStream([dispAudio[0]]))
+                      .connect(dest);
+                  }
+                  if (micStreamRef.current) {
+                    const g = ctx.createGain();
+                    g.gain.value = Math.max(0, micGain);
+                    ctx
+                      .createMediaStreamSource(micStreamRef.current)
+                      .connect(g)
+                      .connect(dest);
+                  }
+                  const fresh = dest.stream.getAudioTracks()[0];
+                  if (fresh) {
+                    combined.getAudioTracks().forEach((t) => combined.removeTrack(t));
+                    combined.addTrack(fresh);
+                    console.warn(
+                      '[recorder] MP4 encoder rejected the audio config ' +
+                        `(${recorderErrorDetailRef.current}); retrying MP4 at 48 kHz`
+                    );
+                    startedAtRef.current = Date.now();
+                    pausedAccumRef.current = 0;
+                    pausedAtRef.current = null;
+                    setElapsedMs(0);
+                    armAndStart(candidates);
+                    return;
+                  }
+                } catch (e) {
+                  console.error('[recorder] 48 kHz retry failed:', e);
+                }
+              }
+
               if (
                 recorderErrorRef.current &&
                 !retriedWebmRef.current &&

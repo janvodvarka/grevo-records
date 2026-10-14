@@ -494,7 +494,7 @@ function RecordingCard({
             </span>
           ) : (
             <span
-              className="absolute top-2 left-2 px-2 py-0.5 rounded-md bg-accent text-[#1A1408] text-[10px] font-semibold inline-flex items-center gap-1"
+              className="absolute top-2 left-2 px-2 py-0.5 rounded-md bg-accent text-[#141416] text-[10px] font-semibold inline-flex items-center gap-1"
               title="Na Bunny Stream, připraveno k odeslání"
             >
               <Cloud className="w-3 h-3" /> Bunny
@@ -507,7 +507,7 @@ function RecordingCard({
           </span>
         )}
         {hovering && (
-          <span className="absolute bottom-2 left-2 px-2 py-0.5 rounded-md bg-accent text-[#1A1408] text-[10px] font-semibold inline-flex items-center gap-1 animate-fade-in">
+          <span className="absolute bottom-2 left-2 px-2 py-0.5 rounded-md bg-accent text-[#141416] text-[10px] font-semibold inline-flex items-center gap-1 animate-fade-in">
             <Play className="w-2.5 h-2.5 fill-current" /> náhled
           </span>
         )}

@@ -18,7 +18,7 @@
     -moz-osx-font-smoothing: grayscale;
     user-select: none;
     overflow: hidden;
-    background: #111013;
+    background: #0F0F10;
   }
   input,
   textarea {
@@ -26,12 +26,12 @@
   }
   /* Viditelný focus pro klávesnici — wolframový prstenec */
   :focus-visible {
-    outline: 2px solid rgba(232, 163, 61, 0.7);
+    outline: 2px solid rgba(242, 242, 240, 0.65);
     outline-offset: 2px;
     border-radius: 6px;
   }
   ::selection {
-    background: rgba(232, 163, 61, 0.3);
+    background: rgba(242, 242, 240, 0.22);
   }
 }
 
@@ -40,10 +40,10 @@
     @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium
       transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed;
   }
-  /* Primární akce: rozsvícené wolframové tlačítko — tmavý text na jantarové */
+  /* Primární akce: rozsvícená plocha — tmavý text na světlé */
   .btn-primary {
-    @apply btn bg-accent text-[#1A1408] hover:bg-accent-hover font-semibold;
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25), 0 1px 8px rgba(232, 163, 61, 0.2);
+    @apply btn bg-accent text-[#141416] hover:bg-accent-hover font-semibold;
+    box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.12), 0 1px 10px rgba(0, 0, 0, 0.45);
   }
   .btn-secondary {
     @apply btn bg-bg-card text-text-primary border border-bg-border hover:border-text-muted;
@@ -83,13 +83,13 @@
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #2a272e;
+  background: #2B2B2F;
   border-radius: 8px;
   border: 2px solid transparent;
   background-clip: padding-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #3d3944;
+  background: #3C3C42;
   background-clip: padding-box;
 }
 

@@ -12,26 +12,29 @@ export default {
     extend: {
       colors: {
         bg: {
-          DEFAULT: '#111013', // warm near-black, lehce fialovohnědý nádech
-          elev: '#18171B',
-          card: '#1D1B20',
-          border: '#2A272E',
+          DEFAULT: '#0F0F10', // neutrální grafit, ne čerň
+          elev: '#161618',
+          card: '#1C1C1F',
+          border: '#2B2B2F',
         },
         text: {
-          primary: '#EDEAE4', // teplá papírová bílá
-          secondary: '#9B96A0',
-          muted: '#6C6772',
+          primary: '#F2F2F0',
+          secondary: '#9A9A9E',
+          muted: '#68686E',
         },
-        // Akční barva: wolframová jantarová (studiové osvětlení)
+        // Akční barva je v monochromu světlo, ne odstín: rozsvícená plocha.
         accent: {
-          DEFAULT: '#E8A33D',
-          hover: '#F2B45C',
-          subtle: 'rgba(232, 163, 61, 0.13)',
+          DEFAULT: '#F2F2F0',
+          hover: '#FAFAF8',
+          subtle: 'rgba(242, 242, 240, 0.10)',
         },
-        // REC červená — nahrávání + destruktivní akce (tally light)
+        // Jediná barva v celé paletě. Výhradně sémanticky: nahrávání
+        // (tally light) a destruktivní akce. Nikdy jako dekorace.
         danger: '#F5453C',
-        success: '#4FBF67',
+        // V monochromu se úspěch značí světlem, ne zelenou.
+        success: '#F2F2F0',
       },
+
       fontFamily: {
         display: [
           '"Bricolage Grotesque Variable"',
@@ -61,7 +64,7 @@ export default {
       },
       boxShadow: {
         soft: '0 4px 20px rgba(0, 0, 0, 0.45)',
-        glow: '0 0 0 1px rgba(232, 163, 61, 0.25), 0 4px 24px rgba(232, 163, 61, 0.12)',
+        glow: '0 0 0 1px rgba(242, 242, 240, 0.20), 0 4px 24px rgba(0, 0, 0, 0.55)',
         rec: '0 0 0 1px rgba(245, 69, 60, 0.35), 0 0 32px rgba(245, 69, 60, 0.25)',
       },
       animation: {
