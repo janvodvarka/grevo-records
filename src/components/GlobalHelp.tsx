@@ -26,6 +26,7 @@ const SECTIONS: Section[] = [
       ['C', 'Vyříznout úsek na pozici'],
       ['Shift + drag', 'Nakreslit výřez na timeline'],
       ['Delete / Backspace', 'Odebrat výřez'],
+      ['⌘Z / ⇧⌘Z', 'Krok zpět / vpřed ve střihu'],
     ],
   },
 ];

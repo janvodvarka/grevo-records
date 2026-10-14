@@ -13,6 +13,8 @@ import {
   Save,
   ZoomIn,
   ZoomOut,
+  Undo2,
+  Redo2,
 } from 'lucide-react';
 import type { StoredRecording } from '../types';
 import { formatBytes, formatDuration } from '../lib/format';
@@ -51,6 +53,27 @@ interface DeleteRegion {
   id: string;
   start: number;
   end: number;
+}
+
+interface CutSnapshot {
+  trimStart: number;
+  trimEnd: number;
+  deletes: DeleteRegion[];
+}
+
+const HISTORY_LIMIT = 100;
+
+function sameCut(a: CutSnapshot, b: CutSnapshot): boolean {
+  return (
+    Math.abs(a.trimStart - b.trimStart) < 1e-6 &&
+    Math.abs(a.trimEnd - b.trimEnd) < 1e-6 &&
+    a.deletes.length === b.deletes.length &&
+    a.deletes.every(
+      (d, i) =>
+        Math.abs(d.start - b.deletes[i].start) < 1e-6 &&
+        Math.abs(d.end - b.deletes[i].end) < 1e-6
+    )
+  );
 }
 
 function genId(): string {
@@ -100,9 +123,18 @@ export function TrimEditor({
     if (loadedIdRef.current === recording.id) return;
     loadedIdRef.current = recording.id;
     const e = recording.edits;
-    setTrimStart(e ? Math.max(0, Math.min(e.trimStart, duration)) : 0);
-    setTrimEnd(e ? Math.max(0, Math.min(e.trimEnd, duration)) : duration);
-    setDeletes((e?.deletes ?? []).map((d) => ({ id: genId(), start: d.start, end: d.end })));
+    const next: CutSnapshot = {
+      trimStart: e ? Math.max(0, Math.min(e.trimStart, duration)) : 0,
+      trimEnd: e ? Math.max(0, Math.min(e.trimEnd, duration)) : duration,
+      deletes: (e?.deletes ?? []).map((d) => ({ id: genId(), start: d.start, end: d.end })),
+    };
+    // A different recording is not an edit: start its history fresh.
+    undoStackRef.current = [];
+    redoStackRef.current = [];
+    committedCutRef.current = next;
+    setTrimStart(next.trimStart);
+    setTrimEnd(next.trimEnd);
+    setDeletes(next.deletes);
   }, [recording.id, recording.edits, duration]);
   const [playhead, setPlayhead] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -131,6 +163,57 @@ export function TrimEditor({
   const expectedScrollRef = useRef(0);
   const dragRef = useRef<DragHandle>(null);
   const justDraggedRef = useRef(false);
+
+  // ────── Undo / redo ──────
+  // History of the cut (trim range + cut regions). A drag is ONE step: while
+  // a handle or region is being dragged nothing is recorded, and the drag's
+  // end commits once — otherwise every mousemove would be its own step.
+  // Discrete actions (cut here, find silence, reset, remove a cut, I/O keys)
+  // are a step each.
+  const liveCutRef = useRef<CutSnapshot>({ trimStart, trimEnd, deletes });
+  liveCutRef.current = { trimStart, trimEnd, deletes };
+  const committedCutRef = useRef<CutSnapshot>(liveCutRef.current);
+  const undoStackRef = useRef<CutSnapshot[]>([]);
+  const redoStackRef = useRef<CutSnapshot[]>([]);
+  const [, setHistoryTick] = useState(0); // re-render so the buttons update
+
+  const commitCut = useCallback(() => {
+    const cur = liveCutRef.current;
+    if (sameCut(cur, committedCutRef.current)) return;
+    undoStackRef.current.push(committedCutRef.current);
+    if (undoStackRef.current.length > HISTORY_LIMIT) undoStackRef.current.shift();
+    redoStackRef.current = [];
+    committedCutRef.current = cur;
+    setHistoryTick((t) => t + 1);
+  }, []);
+
+  const applyCut = useCallback((c: CutSnapshot) => {
+    committedCutRef.current = c;
+    setTrimStart(c.trimStart);
+    setTrimEnd(c.trimEnd);
+    setDeletes(c.deletes);
+    setHistoryTick((t) => t + 1);
+  }, []);
+
+  const undo = useCallback(() => {
+    commitCut(); // fold in anything still pending
+    const prev = undoStackRef.current.pop();
+    if (!prev) return;
+    redoStackRef.current.push(committedCutRef.current);
+    applyCut(prev);
+  }, [commitCut, applyCut]);
+
+  const redo = useCallback(() => {
+    const next = redoStackRef.current.pop();
+    if (!next) return;
+    undoStackRef.current.push(committedCutRef.current);
+    applyCut(next);
+  }, [applyCut]);
+
+  // Any change made outside a drag is one step.
+  useEffect(() => {
+    if (!dragRef.current) commitCut();
+  }, [trimStart, trimEnd, deletes, commitCut]);
 
   // Alt-drag on track creates a new delete region as user drags.
   const altDragRef = useRef<{ id: string; startSec: number } | null>(null);
@@ -444,7 +527,9 @@ export function TrimEditor({
       }
     };
     const onUp = () => {
+      const wasDragging = !!dragRef.current;
       dragRef.current = null;
+      if (wasDragging) commitCut();
       // Keep justDraggedRef true briefly so click events ignore the drag-end
       setTimeout(() => {
         justDraggedRef.current = false;
@@ -567,6 +652,20 @@ export function TrimEditor({
       }
       if (exporting) return;
 
+      // Undo / redo of the cut. Typing in an input is excluded above, so a
+      // rename field keeps its own native text undo.
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && (e.key === 'z' || e.key === 'Z')) {
+        e.preventDefault();
+        if (e.shiftKey) redo();
+        else undo();
+        return;
+      }
+      if (e.ctrlKey && !e.metaKey && !e.altKey && (e.key === 'y' || e.key === 'Y')) {
+        e.preventDefault();
+        redo();
+        return;
+      }
+
       // Timeline zoom: = / + in, - out, 0 fit. Leave Cmd/Ctrl combos to the browser.
       if (!e.metaKey && !e.ctrlKey && !e.altKey) {
         if (e.key === '=' || e.key === '+') {
@@ -644,7 +743,7 @@ export function TrimEditor({
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [exporting, trimStart, trimEnd, deletes, videoEl, zoomBy, zoomFit]);
+  }, [exporting, trimStart, trimEnd, deletes, videoEl, zoomBy, zoomFit, undo, redo]);
 
   const handleTrackClick = (e: React.MouseEvent) => {
     if (justDraggedRef.current) return; // ignore click that completed a drag
@@ -888,6 +987,7 @@ export function TrimEditor({
           <Shortcut keys="C" desc="Vyříznout úsek tady" />
           <Shortcut keys="Shift + drag" desc="Nakreslit výřez na timeline" />
           <Shortcut keys="⌫ / Delete" desc="Odebrat výřez" />
+          <Shortcut keys="⌘Z / ⇧⌘Z" desc="Krok zpět / vpřed" />
           <Shortcut keys="+ / -" desc="Přiblížit / oddálit timeline" />
           <Shortcut keys="0" desc="Celé video na timeline" />
           <Shortcut keys="⌘ + kolečko" desc="Zoom na kurzor (i pinch)" />
@@ -1055,6 +1155,26 @@ export function TrimEditor({
               <Trash className="w-3.5 h-3.5" /> Reset
             </button>
           )}
+          <div className="inline-flex items-center">
+            <button
+              onClick={undo}
+              disabled={exporting || undoStackRef.current.length === 0}
+              className="btn-ghost p-2"
+              title="Krok zpět (⌘Z)"
+              aria-label="Krok zpět"
+            >
+              <Undo2 className="w-4 h-4" />
+            </button>
+            <button
+              onClick={redo}
+              disabled={exporting || redoStackRef.current.length === 0}
+              className="btn-ghost p-2"
+              title="Krok vpřed (⇧⌘Z)"
+              aria-label="Krok vpřed"
+            >
+              <Redo2 className="w-4 h-4" />
+            </button>
+          </div>
         </div>
 
         <div className="flex items-center gap-2 ml-auto">
