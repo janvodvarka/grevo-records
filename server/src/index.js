@@ -417,6 +417,74 @@ function streamApi(method, apiPath, key, body) {
   });
 }
 
+// ────── Empty videos: never leave them, clean up the ones that slipped by ──────
+// A Stream video is created before (or, with a cut, just before) its bytes are
+// PUT. If the process dies in between — a container update, a crash, an OOM
+// kill — nothing runs the DELETE and the library keeps a 0 B video stuck in
+// "Processing" forever. Two defences: in-flight videos are deleted on
+// shutdown, and old empty ones are swept on the next request.
+const inflightVideos = new Map(); // guid -> { library, key }
+
+function trackVideo(creds, guid) {
+  inflightVideos.set(guid, { library: creds.library, key: creds.key });
+}
+
+function settleVideo(guid) {
+  inflightVideos.delete(guid);
+}
+
+function dropVideo(creds, guid) {
+  inflightVideos.delete(guid);
+  return streamApi('DELETE', `/library/${creds.library}/videos/${guid}`, creds.key).catch(
+    () => {}
+  );
+}
+
+// Bunny status: 0 Created, 6 UploadFailed. With no stored bytes after this
+// long, the upload that created it is certainly dead (a body upload is capped
+// at CONVERT_REQ_TIMEOUT_MS).
+const EMPTY_VIDEO_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+const SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+const lastSweep = new Map(); // library -> ms
+
+function parseBunnyDate(raw) {
+  if (!raw) return NaN;
+  const str = String(raw);
+  // Bunny returns UTC timestamps without a zone suffix.
+  return Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(str) ? str : str + 'Z');
+}
+
+async function sweepEmptyVideos(creds) {
+  const now = Date.now();
+  if (now - (lastSweep.get(creds.library) || 0) < SWEEP_INTERVAL_MS) return;
+  lastSweep.set(creds.library, now);
+  try {
+    const r = await streamApi(
+      'GET',
+      `/library/${creds.library}/videos?page=1&itemsPerPage=100&orderBy=date`,
+      creds.key
+    );
+    if (r.status < 200 || r.status >= 300) return;
+    const items = JSON.parse(r.body).items || [];
+    for (const v of items) {
+      const status = Number(v.status);
+      const age = now - parseBunnyDate(v.dateUploaded);
+      if (
+        (status === 0 || status === 6) &&
+        !Number(v.storageSize) &&
+        !Number(v.length) &&
+        age > EMPTY_VIDEO_MAX_AGE_MS &&
+        !inflightVideos.has(v.guid)
+      ) {
+        console.warn(`[stream:sweep] deleting empty video guid=${v.guid} title="${v.title}"`);
+        await dropVideo(creds, v.guid);
+      }
+    }
+  } catch (err) {
+    console.error('[stream:sweep-error]', err.message);
+  }
+}
+
 app.post('/upload-stream', async (req, res) => {
   if (!checkSecret(req, res)) return;
   const creds = readStreamCreds(req, res);
@@ -430,6 +498,7 @@ app.post('/upload-stream', async (req, res) => {
     String(req.query.name || 'recording').replace(/\.[^.]*$/, '').slice(0, 200) ||
     'recording';
   const collection = String(req.query.collection || '').trim();
+  void sweepEmptyVideos(creds);
 
   // Edits are non-destructive in the app: when the user has cut the video,
   // the original arrives here with the kept segments and is cut natively.
@@ -468,6 +537,7 @@ app.post('/upload-stream', async (req, res) => {
     return res.status(502).json({ ok: false, error: err.message });
   }
 
+  trackVideo(creds, guid);
   console.log(`[stream] upload lib=${creds.library} guid=${guid} title="${title}"`);
 
   // 2) Stream the request body straight to the video upload endpoint
@@ -508,6 +578,7 @@ app.post('/upload-stream', async (req, res) => {
         const status = upRes.statusCode || 0;
         const body = Buffer.concat(chunks).toString('utf8');
         if (status >= 200 && status < 300) {
+          settleVideo(guid);
           res.json({
             ok: true,
             guid,
@@ -519,9 +590,7 @@ app.post('/upload-stream', async (req, res) => {
         } else {
           console.warn(`[stream:upload-fail] ${status} ${body.slice(0, 200)}`);
           // Don't leave an empty video object behind
-          streamApi('DELETE', `/library/${creds.library}/videos/${guid}`, creds.key).catch(
-            () => {}
-          );
+          void dropVideo(creds, guid);
           res.status(status || 502).json({
             ok: false,
             error: `Bunny Stream upload selhal: ${status}`,
@@ -534,7 +603,7 @@ app.post('/upload-stream', async (req, res) => {
 
   uploadReq.on('error', (err) => {
     console.error(`[stream:proxy-error] ${progressLine()}`, err);
-    streamApi('DELETE', `/library/${creds.library}/videos/${guid}`, creds.key).catch(() => {});
+    void dropVideo(creds, guid);
     if (!res.headersSent) res.status(502).json({ ok: false, error: err.message });
   });
   req.on('error', (err) => {
@@ -544,7 +613,7 @@ app.post('/upload-stream', async (req, res) => {
   req.on('aborted', () => {
     console.warn(`[stream:aborted] ${progressLine()}`);
     uploadReq.destroy();
-    streamApi('DELETE', `/library/${creds.library}/videos/${guid}`, creds.key).catch(() => {});
+    void dropVideo(creds, guid);
   });
   req.on('end', () => {
     console.log(`[stream:body-complete] ${progressLine()}`);
@@ -618,6 +687,7 @@ async function handleCutStreamUpload(req, res, creds, title, collection, segment
     }
     guid = JSON.parse(created.body).guid;
     if (!guid) throw new Error('Bunny Stream nevrátil guid videa');
+    trackVideo(creds, guid);
     bailIfGone();
 
     const result = await new Promise((resolve, reject) => {
@@ -653,6 +723,7 @@ async function handleCutStreamUpload(req, res, creds, title, collection, segment
     });
 
     if (result.status >= 200 && result.status < 300) {
+      settleVideo(guid);
       return res.json({
         ok: true,
         guid,
@@ -663,16 +734,14 @@ async function handleCutStreamUpload(req, res, creds, title, collection, segment
       });
     }
     console.warn(`[stream:cut-upload-fail] ${result.status} ${result.body.slice(0, 200)}`);
-    streamApi('DELETE', `/library/${creds.library}/videos/${guid}`, creds.key).catch(() => {});
+    void dropVideo(creds, guid);
     return res.status(result.status || 502).json({
       ok: false,
       error: `Bunny Stream upload selhal (${result.status}).`,
     });
   } catch (err) {
     console.error(clientGone ? '[stream:cut-cancelled]' : '[stream:cut-error]', err.message);
-    if (guid) {
-      streamApi('DELETE', `/library/${creds.library}/videos/${guid}`, creds.key).catch(() => {});
-    }
+    if (guid) void dropVideo(creds, guid);
     if (!res.headersSent) {
       res.status(String(err.message).startsWith('cut:') ? 422 : 502).json({
         ok: false,
@@ -693,6 +762,7 @@ app.get('/stream-status', async (req, res) => {
   if (!creds) return;
   const guid = String(req.query.guid || '').trim();
   if (!guid) return res.status(400).json({ ok: false, error: 'Missing "guid"' });
+  void sweepEmptyVideos(creds);
 
   try {
     const r = await streamApi(
@@ -794,3 +864,23 @@ server.requestTimeout = CONVERT_REQ_TIMEOUT_MS; // 35 min for the whole body
 server.headersTimeout = 60_000; // must stay below requestTimeout
 server.keepAliveTimeout = 65_000;
 server.timeout = 0; // no socket idle cap; routes set their own
+
+// Node as PID 1 in the container has no default SIGTERM handler, so an
+// update used to hard-kill the proxy mid-upload and orphan the video it was
+// filling. Delete in-flight videos first (the browser sees the upload fail
+// and retries against the new container), then exit.
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const pending = [...inflightVideos.entries()];
+  console.warn(`[records-by-grevo-proxy] ${signal}: deleting ${pending.length} in-flight video(s)`);
+  server.close();
+  await Promise.race([
+    Promise.all(pending.map(([guid, creds]) => dropVideo(creds, guid))),
+    new Promise((r) => setTimeout(r, 8000)),
+  ]);
+  process.exit(0);
+}
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
