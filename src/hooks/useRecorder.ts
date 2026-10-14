@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { toast } from '../lib/toast';
+import { cueCountdown, cueStart, cueStop } from '../lib/cues';
 import {
   appendBufferChunk,
   deleteBufferSession,
@@ -114,6 +115,14 @@ export interface MimeNegotiation {
  * the user's only copy — it is kept, never silently discarded.
  */
 const RETRY_ONLY_WITHIN_MS = 3000;
+
+/**
+ * Largest frame Chrome's H.264 encoder accepts. Verified in Chrome: 3840x2160
+ * starts, 5120x2880 fails with EncodingError. Screens bigger than this get
+ * downscaled rather than knocking the whole recording off MP4.
+ */
+const MAX_CAPTURE_WIDTH = 3840;
+const MAX_CAPTURE_HEIGHT = 2160;
 
 let lastNegotiation: MimeNegotiation | null = null;
 
@@ -297,12 +306,46 @@ export function useRecorder(): UseRecorderReturn {
       setState('preparing');
       try {
         // 1) Screen — native picker
+        // Cap the capture at 4K. Chrome's H.264 encoder refuses anything
+        // larger — a 5120x2880 share (Studio Display, iMac 5K, a Retina panel
+        // captured at its full backing resolution) fails at start with
+        // "EncodingError: The given encoder configuration is not supported by
+        // the encoder" and the recording silently drops to WebM. Reproduced
+        // exactly: 3840x2160 starts fine, 5120x2880 does not.
         const displayMS = await navigator.mediaDevices.getDisplayMedia({
-          video: { frameRate: 30 } as MediaTrackConstraints,
+          video: {
+            frameRate: 30,
+            width: { max: MAX_CAPTURE_WIDTH },
+            height: { max: MAX_CAPTURE_HEIGHT },
+          } as MediaTrackConstraints,
           audio: true,
         });
         displayStreamRef.current = displayMS;
         setDisplayStream(displayMS);
+
+        // getDisplayMedia treats size as advisory for screen surfaces, so the
+        // track can still come back oversized. Ask again explicitly; if the
+        // browser still will not downscale, the compositor below does it.
+        const dispTrack = displayMS.getVideoTracks()[0];
+        const dispSize = dispTrack?.getSettings();
+        if (
+          dispTrack &&
+          ((dispSize?.width ?? 0) > MAX_CAPTURE_WIDTH ||
+            (dispSize?.height ?? 0) > MAX_CAPTURE_HEIGHT)
+        ) {
+          console.warn(
+            `[recorder] capture is ${dispSize?.width}x${dispSize?.height}, above the ` +
+              'H.264 ceiling; requesting a downscale'
+          );
+          try {
+            await dispTrack.applyConstraints({
+              width: { max: MAX_CAPTURE_WIDTH },
+              height: { max: MAX_CAPTURE_HEIGHT },
+            });
+          } catch (e) {
+            console.warn('[recorder] applyConstraints downscale refused:', e);
+          }
+        }
 
         if (cancelledRef.current) {
           stopAllStreams();
@@ -450,12 +493,14 @@ export function useRecorder(): UseRecorderReturn {
         if (countdownSeconds > 0) {
           setState('countdown');
           setCountdownRemaining(countdownSeconds);
+          cueCountdown();
           await new Promise<void>((resolve) => {
             countdownResolveRef.current = resolve;
             let remaining = countdownSeconds;
             countdownTimerRef.current = window.setInterval(() => {
               remaining -= 1;
               setCountdownRemaining(remaining);
+              if (remaining > 0 && !cancelledRef.current) cueCountdown();
               if (remaining <= 0 || cancelledRef.current) {
                 if (countdownTimerRef.current !== null) {
                   clearInterval(countdownTimerRef.current);
@@ -766,6 +811,7 @@ export function useRecorder(): UseRecorderReturn {
           recorder.start(1000);
         };
 
+        cueStart();
         armAndStart(mimeCandidates(!!audioTrack));
 
         displayMS.getVideoTracks()[0].onended = () => {
@@ -820,6 +866,7 @@ export function useRecorder(): UseRecorderReturn {
   }, []);
 
   const stop = useCallback(() => {
+    cueStop();
     return new Promise<StopResult | null>((resolve) => {
       const rec = recorderRef.current;
       if (!rec || rec.state === 'inactive') {
