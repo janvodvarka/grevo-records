@@ -15,6 +15,7 @@ import {
   Loader2,
   ShieldCheck,
   Scissors,
+  Check,
 } from 'lucide-react';
 import type { StoredRecording } from '../types';
 import { formatBytes, formatDate, formatDuration } from '../lib/format';
@@ -23,7 +24,13 @@ import { downloadBlob } from '../lib/download';
 import { UploadButton } from './UploadButton';
 import { confirmDialog } from '../lib/confirm';
 import { keptSegments, editedDurationMs, materialize } from '../lib/edits';
-import { onRecordingUpdated } from '../lib/uploads';
+import {
+  isActive,
+  latestJobFor,
+  onRecordingUpdated,
+  streamProgressFor,
+  useUploadJobs,
+} from '../lib/uploads';
 import { toast } from '../lib/toast';
 
 type FilterMode = 'all' | 'uploaded' | 'local';
@@ -506,30 +513,6 @@ function RecordingCard({
           )}
         </button>
 
-        {rec.uploadedUrl && (
-          rec.streamStatus === 'processing' ? (
-            <span
-              className="absolute top-2 left-2 px-2 py-0.5 rounded-md bg-bg-card/90 text-text-primary text-[10px] font-medium inline-flex items-center gap-1"
-              title="Bunny Stream video zpracovává"
-            >
-              <Loader2 className="w-3 h-3 animate-spin text-accent" /> Zpracovává…
-            </span>
-          ) : rec.streamStatus === 'error' ? (
-            <span
-              className="absolute top-2 left-2 px-2 py-0.5 rounded-md bg-danger text-white text-[10px] font-semibold inline-flex items-center gap-1"
-              title="Zpracování na Bunny selhalo"
-            >
-              <AlertTriangle className="w-3 h-3" /> Chyba
-            </span>
-          ) : (
-            <span
-              className="absolute top-2 left-2 px-2 py-0.5 rounded-md bg-accent text-[#141416] text-[10px] font-semibold inline-flex items-center gap-1"
-              title="Na Bunny Stream, připraveno k odeslání"
-            >
-              <Cloud className="w-3 h-3" /> Bunny
-            </span>
-          )
-        )}
         {rec.durationMs > 0 && (
           <span
             className="absolute bottom-2 right-2 px-2 py-0.5 rounded-md bg-black/70 text-xs font-mono inline-flex items-center gap-1"
@@ -553,7 +536,9 @@ function RecordingCard({
           <span>{formatDate(rec.createdAt)}</span>
           <span>{formatBytes(rec.size)}</span>
         </div>
-        <div className="flex items-center justify-end gap-1 mt-3 opacity-0 group-hover:opacity-100 transition-opacity">
+        <div className="flex items-center justify-between gap-2 mt-3">
+          <CloudStatus rec={rec} />
+          <div className="flex items-center gap-1 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
           <UploadButton recording={rec} variant="icon" onUploaded={onChanged} />
           <span
             onClick={onDownload}
@@ -569,8 +554,96 @@ function RecordingCard({
           >
             <Trash2 className="w-4 h-4" />
           </span>
+          </div>
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * Where the recording lives, always visible on the card: online on Bunny
+ * (click copies the link), on its way there, failed, or only in this browser.
+ */
+function CloudStatus({ rec }: { rec: StoredRecording }) {
+  const jobs = useUploadJobs();
+  const [copied, setCopied] = useState(false);
+  const raw = latestJobFor(rec.id, jobs);
+  const job =
+    raw && isActive(raw) && !(rec.edits && rec.edits.updatedAt > raw.createdAt) ? raw : undefined;
+
+  const pill = 'inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium min-w-0';
+
+  if (job) {
+    const label =
+      job.status === 'queued'
+        ? 'Ve frontě'
+        : job.status === 'cutting'
+        ? 'Stříhá se…'
+        : `Nahrává ${Math.round(job.pct)} %`;
+    return (
+      <span className={`${pill} bg-bg-elev text-text-primary`}>
+        <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+        <span className="truncate">{label}</span>
+      </span>
+    );
+  }
+
+  if (rec.uploadedUrl) {
+    if (rec.streamStatus === 'processing') {
+      const p = streamProgressFor(rec.id);
+      return (
+        <span className={`${pill} bg-bg-elev text-text-primary`} title="Video je na Bunny, Bunny ho ještě zpracovává">
+          <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+          <span className="truncate">Zpracovává{p ? ` ${Math.round(p)} %` : '…'}</span>
+        </span>
+      );
+    }
+    if (rec.streamStatus === 'error') {
+      return (
+        <span className={`${pill} bg-danger/15 text-danger`} title="Zpracování na Bunny selhalo. Otevři nahrávku a dej Nahrát znovu.">
+          <AlertTriangle className="w-3 h-3 shrink-0" />
+          <span className="truncate">Chyba</span>
+        </span>
+      );
+    }
+    const link = /^https?:\/\//i.test(rec.uploadedUrl) ? rec.uploadedUrl : 'https://' + rec.uploadedUrl;
+    return (
+      <span
+        role="button"
+        onClick={async (e) => {
+          e.stopPropagation();
+          try {
+            await navigator.clipboard.writeText(link);
+            setCopied(true);
+            toast.success('Link zkopírován do schránky.');
+            setTimeout(() => setCopied(false), 1500);
+          } catch {
+            toast.error('Nepodařilo se zkopírovat. Zkus znovu.');
+          }
+        }}
+        className={`${pill} bg-accent text-[#141416] cursor-pointer hover:opacity-90`}
+        title={`Online na Bunny. Klikni pro zkopírování linku (${link})`}
+      >
+        {copied ? <Check className="w-3 h-3 shrink-0" /> : <Cloud className="w-3 h-3 shrink-0" />}
+        <span className="truncate">{copied ? 'Zkopírováno' : 'Online'}</span>
+      </span>
+    );
+  }
+
+  if (rec.uploadError) {
+    return (
+      <span className={`${pill} bg-danger/15 text-danger`} title={`Upload selhal: ${rec.uploadError}`}>
+        <AlertTriangle className="w-3 h-3 shrink-0" />
+        <span className="truncate">Selhalo</span>
+      </span>
+    );
+  }
+
+  return (
+    <span className={`${pill} border border-bg-border text-text-muted`} title="Zatím jen v tomhle prohlížeči, na Bunny není">
+      <HardDrive className="w-3 h-3 shrink-0" />
+      <span className="truncate">Lokálně</span>
+    </span>
   );
 }

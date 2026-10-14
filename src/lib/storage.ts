@@ -139,6 +139,7 @@ export async function setUploadedUrl(
   if (!rec) return null;
   rec.uploadedUrl = uploadedUrl;
   rec.uploadedAt = Date.now();
+  rec.uploadError = undefined;
   if (streamGuid) rec.streamGuid = streamGuid;
   rec.streamStatus = 'processing';
   await req(store.put(rec));
@@ -167,6 +168,19 @@ export async function setRecordingEdits(
     rec.streamGuid = undefined;
     rec.streamStatus = undefined;
   }
+  await req(store.put(rec));
+  return rec;
+}
+
+/** Remembers (or clears, with null) why the last upload failed. */
+export async function setUploadError(
+  id: string,
+  message: string | null
+): Promise<StoredRecording | null> {
+  const store = await tx('readwrite');
+  const rec = await req<StoredRecording | undefined>(store.get(id));
+  if (!rec) return null;
+  rec.uploadError = message ?? undefined;
   await req(store.put(rec));
   return rec;
 }

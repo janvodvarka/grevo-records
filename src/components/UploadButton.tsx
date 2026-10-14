@@ -293,8 +293,10 @@ export function UploadButton({ recording, variant = 'secondary', onUploaded }: P
       >
         <UploadCloud className="w-4 h-4" /> Nahrát na Bunny
       </button>
-      {job?.status === 'error' && (
-        <span className="text-xs text-danger max-w-[260px]">{job.error}</span>
+      {(job?.status === 'error' ? job.error : recording.uploadError) && (
+        <span className="text-xs text-danger max-w-[320px]">
+          Minulý upload selhal: {job?.status === 'error' ? job.error : recording.uploadError}
+        </span>
       )}
     </div>
   );

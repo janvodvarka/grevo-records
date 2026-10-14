@@ -12,7 +12,13 @@
 
 import { useEffect, useState } from 'react';
 import type { StoredRecording } from '../types';
-import { clearUpload, getRecording, setStreamStatus, setUploadedUrl } from './storage';
+import {
+  clearUpload,
+  getRecording,
+  setStreamStatus,
+  setUploadedUrl,
+  setUploadError,
+} from './storage';
 import { pollStreamStatus, uploadToBunny, UPLOAD_CANCELLED } from './upload';
 import { keptSegments } from './edits';
 import { toast } from './toast';
@@ -217,9 +223,15 @@ async function runJob(id: string) {
     const err = e as Error;
     if (err.name === UPLOAD_CANCELLED) {
       patch(id, { status: 'cancelled' });
+      const cleared = await setUploadError(rec.id, null).catch(() => null);
+      if (cleared) announce(cleared);
       toast.info(`Upload zrušen: ${job.name}`);
     } else {
       patch(id, { status: 'error', error: err.message });
+      // Kept on the recording: the tray is gone after a reload, the reason
+      // should not be.
+      const failed = await setUploadError(rec.id, err.message).catch(() => null);
+      if (failed) announce(failed);
       toast.error(err.message, { title: `Upload selhal: ${job.name}` });
     }
   } finally {

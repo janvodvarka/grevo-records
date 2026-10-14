@@ -38,6 +38,8 @@ export interface StoredRecording {
    * 'ready' once transcoded (link is safe to send), 'error' on failure.
    */
   streamStatus?: 'processing' | 'ready' | 'error';
+  /** Why the last upload attempt failed (kept so the library can say so). */
+  uploadError?: string;
   /** Saved cut, if any. Absent = the whole recording. */
   edits?: RecordingEdits;
 }
