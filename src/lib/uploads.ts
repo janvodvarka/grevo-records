@@ -111,8 +111,8 @@ function announce(rec: StoredRecording) {
  * here: if it was fine, links already sent keep working.
  */
 export async function reupload(rec: StoredRecording): Promise<string> {
+  stopWatching(rec.id);
   const cleared = (await clearUpload(rec.id)) ?? rec;
-  streamProgress.delete(rec.id);
   jobs = jobs.filter((j) => j.recordingId !== rec.id || isActive(j));
   announce(cleared);
   return enqueueUpload(cleared, cleared.name);
@@ -229,7 +229,12 @@ async function runJob(id: string) {
 
 // Bunny encode-status polling lives here too, so the "link je připravený"
 // notice arrives even when the user is on another screen.
-const polling = new Set<string>();
+//
+// One poll per recording, tied to the guid it watches. A re-upload replaces
+// the guid: the old poll is stopped, and a result for a guid the recording no
+// longer points to is ignored — otherwise the old broken video's "failed"
+// would land on the fresh upload.
+const polls = new Map<string, { guid: string; ac: AbortController }>();
 // Last known Bunny encode progress per recording, so "zpracovává" shows
 // whether it is actually moving.
 const streamProgress = new Map<string, number>();
@@ -238,18 +243,38 @@ export function streamProgressFor(recordingId: string): number | undefined {
   return streamProgress.get(recordingId);
 }
 
+function stopWatching(recordingId: string) {
+  polls.get(recordingId)?.ac.abort();
+  polls.delete(recordingId);
+  if (streamProgress.delete(recordingId)) emit();
+}
+
 export function watchStreamStatus(recordingId: string, guid: string, name?: string) {
-  if (polling.has(recordingId)) return;
-  polling.add(recordingId);
-  pollStreamStatus(guid, (s) => {
-    if (s.state !== 'processing') return;
-    streamProgress.set(recordingId, s.encodeProgress);
-    emit();
-  })
+  const existing = polls.get(recordingId);
+  if (existing?.guid === guid) return;
+  stopWatching(recordingId);
+  const ac = new AbortController();
+  polls.set(recordingId, { guid, ac });
+
+  pollStreamStatus(
+    guid,
+    (s) => {
+      if (ac.signal.aborted || s.state !== 'processing') return;
+      streamProgress.set(recordingId, s.encodeProgress);
+      emit();
+    },
+    { signal: ac.signal }
+  )
     .then(async (final) => {
+      if (ac.signal.aborted) return;
       streamProgress.delete(recordingId);
       emit();
       if (final.state === 'processing') return; // timed out, leave as is
+      const current = await getRecording(recordingId);
+      if (!current || current.streamGuid !== guid) return; // re-uploaded since
+      // Re-checks of an already known outcome (e.g. reopening the recording)
+      // update quietly; only a change is worth a notification.
+      const changed = current.streamStatus !== final.state;
       const updated = await setStreamStatus(recordingId, final.state).catch(() => null);
       if (updated) announce(updated);
       if (final.state === 'ready') {
@@ -258,6 +283,7 @@ export function watchStreamStatus(recordingId: string, guid: string, name?: stri
         );
         emit();
       }
+      if (!changed) return;
       if (final.state === 'ready') {
         toast.success(`${name ?? 'Video'} je zpracované, link je připravený poslat klientovi.`, {
           title: 'Hotovo',
@@ -275,7 +301,9 @@ export function watchStreamStatus(recordingId: string, guid: string, name?: stri
       }
     })
     .catch(() => {})
-    .finally(() => polling.delete(recordingId));
+    .finally(() => {
+      if (polls.get(recordingId)?.ac === ac) polls.delete(recordingId);
+    });
 }
 
 if (typeof window !== 'undefined') {

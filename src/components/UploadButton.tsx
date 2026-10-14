@@ -66,9 +66,11 @@ export function UploadButton({ recording, variant = 'secondary', onUploaded }: P
   const streamState: 'processing' | 'ready' | 'error' =
     recording.streamStatus ?? (job?.status === 'done' ? 'processing' : 'ready');
 
-  // Re-opened a recording Bunny was still processing: keep watching it.
+  // Re-opened a recording that is not confirmed ready: check Bunny again.
+  // A "failed" may be stale (it was once written from an older upload's
+  // video), so it is re-checked too; an unchanged outcome stays quiet.
   useEffect(() => {
-    if (recording.uploadedUrl && recording.streamGuid && recording.streamStatus === 'processing') {
+    if (recording.uploadedUrl && recording.streamGuid && recording.streamStatus !== 'ready') {
       watchStreamStatus(recording.id, recording.streamGuid, recording.name);
     }
   }, [recording.id, recording.uploadedUrl, recording.streamGuid, recording.streamStatus, recording.name]);
