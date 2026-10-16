@@ -11,6 +11,16 @@ export interface BunnySettings {
   autoUpload: boolean;
 }
 
+/**
+ * The collection GUID out of whatever was pasted: the bare GUID, the
+ * dashboard URL, or a GUID with "?colid=…" glued on. Bunny refuses anything
+ * but the bare GUID with a 400. Unrecognised text is passed through trimmed.
+ */
+export function normalizeCollectionId(raw: string): string {
+  const m = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.exec(raw);
+  return m ? m[0].toLowerCase() : raw.trim();
+}
+
 export const DEFAULT_BUNNY: BunnySettings = {
   enabled: false,
   libraryId: '',

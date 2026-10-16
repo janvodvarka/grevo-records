@@ -14,6 +14,7 @@ import {
   loadBunnySettings,
   saveBunnySettings,
   type BunnySettings,
+  normalizeCollectionId,
 } from '../lib/settings';
 import { PROXY_URL } from '../lib/proxy-config';
 import { toast } from '../lib/toast';
@@ -152,7 +153,7 @@ export function Settings() {
               className="input w-full font-mono"
               placeholder="např. 8f1c2d3e-…"
               value={bunny.collectionId}
-              onChange={(e) => update('collectionId', e.target.value.trim())}
+              onChange={(e) => update('collectionId', normalizeCollectionId(e.target.value))}
             />
           </Field>
 

@@ -1,4 +1,4 @@
-import { loadBunnySettings } from './settings';
+import { loadBunnySettings, normalizeCollectionId } from './settings';
 import { segmentsParam } from './edits';
 import { PROXY_URL, UPLOAD_SECRET } from './proxy-config';
 
@@ -75,8 +75,8 @@ function singleUploadAttempt(
   const base = PROXY_URL.replace(/\/+$/, '');
   const url =
     `${base}/upload-stream?name=${encodeURIComponent(filename)}` +
-    (s.collectionId.trim()
-      ? `&collection=${encodeURIComponent(s.collectionId.trim())}`
+    (normalizeCollectionId(s.collectionId)
+      ? `&collection=${encodeURIComponent(normalizeCollectionId(s.collectionId))}`
       : '') +
     (segments && segments.length > 0
       ? `&segments=${encodeURIComponent(segmentsParam(segments))}`
