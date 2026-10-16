@@ -218,6 +218,13 @@ async function runJob(id: string) {
     patch(id, { status: 'done', pct: 100, url: result.url });
     if (updated) announce(updated);
     toast.success(`${job.name} je na Bunny. Hlídám zpracování…`, { title: 'Nahráno' });
+    if (result.collectionDropped) {
+      toast.warning(
+        'Bunny nezná Collection ID z Nastavení, video je proto v kořeni knihovny. ' +
+          'Oprav nebo vymaž Collection ID v Nastavení.',
+        { title: 'Kolekce nenalezena', duration: 9000 }
+      );
+    }
     if (result.guid) watchStreamStatus(rec.id, result.guid, job.name);
   } catch (e) {
     const err = e as Error;

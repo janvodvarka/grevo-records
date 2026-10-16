@@ -417,6 +417,54 @@ function streamApi(method, apiPath, key, body) {
   });
 }
 
+// ────── Create a Stream video ──────
+// Bunny answers 400 to a create with a collectionId it does not know (a
+// collection deleted in the dashboard, a typo in Settings). The video then
+// goes to the library root instead of failing the whole upload, and the app
+// is told so. Any other refusal carries Bunny's own message to the user.
+function bunnyMessage(body) {
+  try {
+    const j = JSON.parse(body);
+    return String(j.Message || j.message || j.error || '').slice(0, 200);
+  } catch {
+    return String(body || '').slice(0, 200);
+  }
+}
+
+async function createStreamVideo(creds, title, collection, tag) {
+  let created = await streamApi('POST', `/library/${creds.library}/videos`, creds.key, {
+    title,
+    ...(collection ? { collectionId: collection } : {}),
+  });
+  let collectionDropped = false;
+  if (collection && created.status === 400) {
+    console.warn(
+      `[${tag}] create with collection ${collection} refused (400 ${bunnyMessage(created.body)}), ` +
+        'retrying in the library root'
+    );
+    const retry = await streamApi('POST', `/library/${creds.library}/videos`, creds.key, { title });
+    if (retry.status >= 200 && retry.status < 300) {
+      created = retry;
+      collectionDropped = true;
+    }
+  }
+  if (created.status < 200 || created.status >= 300) {
+    const msg = bunnyMessage(created.body);
+    console.warn(`[${tag}-fail] ${created.status} ${created.body.slice(0, 300)}`);
+    const err = new Error(
+      `Bunny Stream: vytvoření videa selhalo (${created.status})` +
+        (msg ? `: ${msg}` : '.') +
+        (created.status === 401 ? ' Zkontroluj Library ID a API klíč.' : '')
+    );
+    // 4xx from Bunny will not get better by retrying the upload.
+    err.httpStatus = created.status === 401 ? 401 : created.status < 500 ? 422 : 502;
+    throw err;
+  }
+  const guid = JSON.parse(created.body).guid;
+  if (!guid) throw new Error('Bunny Stream nevrátil guid videa');
+  return { guid, collectionDropped };
+}
+
 // ────── Empty videos: never leave them, clean up the ones that slipped by ──────
 // A Stream video is created before (or, with a cut, just before) its bytes are
 // PUT. If the process dies in between — a container update, a crash, an OOM
@@ -513,28 +561,12 @@ app.post('/upload-stream', async (req, res) => {
 
   // 1) Create the video object (gets us the guid to upload into)
   let guid;
+  let collectionDropped = false;
   try {
-    const created = await streamApi(
-      'POST',
-      `/library/${creds.library}/videos`,
-      creds.key,
-      { title, ...(collection ? { collectionId: collection } : {}) }
-    );
-    if (created.status < 200 || created.status >= 300) {
-      console.warn(`[stream:create-fail] ${created.status} ${created.body.slice(0, 200)}`);
-      return res.status(created.status === 401 ? 401 : 502).json({
-        ok: false,
-        error:
-          `Bunny Stream: vytvoření videa selhalo (${created.status}).` +
-          (created.status === 401 ? ' Zkontroluj Library ID a API klíč.' : ''),
-        details: created.body.slice(0, 300),
-      });
-    }
-    guid = JSON.parse(created.body).guid;
-    if (!guid) throw new Error('Bunny Stream nevrátil guid videa');
+    ({ guid, collectionDropped } = await createStreamVideo(creds, title, collection, 'stream:create'));
   } catch (err) {
     console.error('[stream:create-error]', err.message);
-    return res.status(502).json({ ok: false, error: err.message });
+    return res.status(err.httpStatus || 502).json({ ok: false, error: err.message });
   }
 
   trackVideo(creds, guid);
@@ -582,6 +614,7 @@ app.post('/upload-stream', async (req, res) => {
           res.json({
             ok: true,
             guid,
+            collectionDropped,
             libraryId: creds.library,
             // Shareable player page (adaptive bitrate, works everywhere)
             url: `https://iframe.mediadelivery.net/play/${creds.library}/${guid}`,
@@ -670,23 +703,8 @@ async function handleCutStreamUpload(req, res, creds, title, collection, segment
     console.log(`[stream:cut] ${cut.mode} cut in ${cut.ms} ms -> ${outSize} B`);
     bailIfGone();
 
-    const created = await streamApi(
-      'POST',
-      `/library/${creds.library}/videos`,
-      creds.key,
-      { title, ...(collection ? { collectionId: collection } : {}) }
-    );
-    if (created.status < 200 || created.status >= 300) {
-      console.warn(`[stream:cut-create-fail] ${created.status} ${created.body.slice(0, 200)}`);
-      return res.status(created.status === 401 ? 401 : 502).json({
-        ok: false,
-        error:
-          `Bunny Stream: vytvoření videa selhalo (${created.status}).` +
-          (created.status === 401 ? ' Zkontroluj Library ID a API klíč.' : ''),
-      });
-    }
-    guid = JSON.parse(created.body).guid;
-    if (!guid) throw new Error('Bunny Stream nevrátil guid videa');
+    let collectionDropped;
+    ({ guid, collectionDropped } = await createStreamVideo(creds, title, collection, 'stream:cut-create'));
     trackVideo(creds, guid);
     bailIfGone();
 
@@ -727,6 +745,7 @@ async function handleCutStreamUpload(req, res, creds, title, collection, segment
       return res.json({
         ok: true,
         guid,
+        collectionDropped,
         libraryId: creds.library,
         url: `https://iframe.mediadelivery.net/play/${creds.library}/${guid}`,
         embedUrl: `https://iframe.mediadelivery.net/embed/${creds.library}/${guid}`,
@@ -743,10 +762,12 @@ async function handleCutStreamUpload(req, res, creds, title, collection, segment
     console.error(clientGone ? '[stream:cut-cancelled]' : '[stream:cut-error]', err.message);
     if (guid) void dropVideo(creds, guid);
     if (!res.headersSent) {
-      res.status(String(err.message).startsWith('cut:') ? 422 : 502).json({
-        ok: false,
-        error: `Střih na serveru selhal: ${err.message}`.slice(0, 400),
-      });
+      res
+        .status(err.httpStatus || (String(err.message).startsWith('cut:') ? 422 : 502))
+        .json({
+          ok: false,
+          error: (err.httpStatus ? err.message : `Střih na serveru selhal: ${err.message}`).slice(0, 400),
+        });
     }
   } finally {
     await fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});

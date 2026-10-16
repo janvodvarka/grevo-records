@@ -9,6 +9,8 @@ export interface UploadResult {
   embedUrl?: string;
   /** Bunny Stream video GUID. */
   guid?: string;
+  /** Bunny refused the collection from Settings; the video went to the library root. */
+  collectionDropped?: boolean;
 }
 
 export type UploadProgress = (loaded: number, total: number, pct: number) => void;
@@ -126,7 +128,12 @@ function singleUploadAttempt(
         data = JSON.parse(xhr.responseText);
       } catch {}
       if (xhr.status >= 200 && xhr.status < 300 && data?.ok) {
-        resolve({ url: data.url, embedUrl: data.embedUrl, guid: data.guid });
+        resolve({
+          url: data.url,
+          embedUrl: data.embedUrl,
+          guid: data.guid,
+          collectionDropped: !!data.collectionDropped,
+        });
       } else {
         const transient = xhr.status === 0 || xhr.status >= 500;
         // 408/413 are the two statuses that mean "the size/duration of this
